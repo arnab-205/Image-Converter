@@ -760,35 +760,69 @@ impl PdfDocument {
 
         let mut objects = Vec::new();
 
-        // Intermediate struct for text collection
-        struct RawTextItem {
-            text: String,
-            bounds: [f64; 4],
+        // Use the page-level text chars API for reliable text extraction.
+        // The page text API (FPDFText_LoadPage) properly resolves font encodings /
+        // ToUnicode CMaps, unlike per-object .text() which often returns gibberish
+        // for PDFs with subsetted or custom fonts.
+        // We iterate over page.text().chars() to get correctly decoded characters
+        // with their individual bounds, then group them into line-level blocks.
+
+        // Intermediate struct for text char collection
+        struct RawCharItem {
+            ch: char,
+            bounds: Option<[f64; 4]>, // None for whitespace without valid bounds
             font_size: f64,
         }
-        let mut raw_texts: Vec<RawTextItem> = Vec::new();
+        let mut raw_chars: Vec<RawCharItem> = Vec::new();
+
+        if let Ok(page_text) = page.text() {
+            for ch in page_text.chars().iter() {
+                let is_generated = ch.is_generated().unwrap_or(false);
+                if let Some(c) = ch.unicode_char() {
+                    let u = c as u32;
+                    // Skip null and replacement chars
+                    if u == 0 || u == 0xFFFD {
+                        continue;
+                    }
+                    // Skip non-whitespace control chars
+                    if u < 32 && !matches!(c, ' ' | '\t' | '\n' | '\r') {
+                        continue;
+                    }
+                    // For generated chars, only keep whitespace (word/line separators)
+                    if is_generated && !c.is_whitespace() {
+                        continue;
+                    }
+
+                    let bounds = ch.loose_bounds().ok().and_then(|b| {
+                        let rect = [
+                            b.left().value as f64,
+                            b.bottom().value as f64,
+                            b.right().value as f64,
+                            b.top().value as f64,
+                        ];
+                        // Zero-size bounds aren't useful
+                        if (rect[2] - rect[0]).abs() < 0.001 && (rect[3] - rect[1]).abs() < 0.001 {
+                            None
+                        } else {
+                            Some(rect)
+                        }
+                    });
+
+                    let font_size = ch.scaled_font_size().value as f64;
+                    raw_chars.push(RawCharItem {
+                        ch: c,
+                        bounds,
+                        font_size,
+                    });
+                }
+            }
+        }
 
         for (idx, obj) in page.objects().iter().enumerate() {
             match obj.object_type() {
                 PdfPageObjectType::Text => {
-                    if let Ok(b) = obj.bounds() {
-                        let text = obj.as_text_object()
-                            .map(|t| t.text())
-                            .unwrap_or_default();
-                        let font_size = obj.as_text_object()
-                            .map(|t| t.scaled_font_size().value as f64)
-                            .unwrap_or(0.0);
-                        raw_texts.push(RawTextItem {
-                            text,
-                            bounds: [
-                                b.left().value as f64,
-                                b.bottom().value as f64,
-                                b.right().value as f64,
-                                b.top().value as f64,
-                            ],
-                            font_size,
-                        });
-                    }
+                    // Text objects are handled via the page text chars API above;
+                    // skip them in the per-object loop.
                 }
                 _ => {
                     let object_type = match obj.object_type() {
@@ -824,79 +858,101 @@ impl PdfDocument {
             }
         }
 
-        // Group text items into line-level blocks with concatenated text
-        if !raw_texts.is_empty() {
-            // Sort by top Y (descending = top of page first), then by left X (ascending)
-            raw_texts.sort_by(|a, b| {
-                let y_cmp = b.bounds[3].partial_cmp(&a.bounds[3]).unwrap_or(std::cmp::Ordering::Equal);
-                if y_cmp == std::cmp::Ordering::Equal {
-                    a.bounds[0].partial_cmp(&b.bounds[0]).unwrap_or(std::cmp::Ordering::Equal)
-                } else {
-                    y_cmp
-                }
-            });
-
-            let mut current_bounds = raw_texts[0].bounds;
-            let mut current_text = raw_texts[0].text.clone();
-            let mut current_font_size = raw_texts[0].font_size;
+        // Group chars into line-level text blocks.
+        // PDFium's chars() API returns characters in reading order, including
+        // generated whitespace (spaces between words, newlines between lines).
+        if !raw_chars.is_empty() {
             let mut group_idx = 0usize;
+            let mut current_bounds: Option<[f64; 4]> = None;
+            let mut current_text = String::new();
+            let mut current_font_size = 0.0f64;
 
-            for item in &raw_texts[1..] {
-                let char_height = (item.bounds[3] - item.bounds[1]).max(0.5);
-                let cur_height = (current_bounds[3] - current_bounds[1]).max(0.5);
-                let ref_height = cur_height.max(char_height);
-                let threshold_y = ref_height * 0.6;
-                let threshold_x = ref_height * 1.5;
+            let flush = |objects: &mut Vec<PageObjectInfo>, text: &str, bounds: &Option<[f64; 4]>, font_size: f64, gidx: &mut usize| {
+                if !text.trim().is_empty() {
+                    if let Some(b) = bounds {
+                        objects.push(PageObjectInfo {
+                            index: 100_000 + *gidx,
+                            object_type: "text".to_string(),
+                            bounds: Some(*b),
+                            image_width: None,
+                            image_height: None,
+                            text_content: Some(text.trim().to_string()),
+                            font_size: Some(font_size),
+                            children: Vec::new(),
+                            parent_index: None,
+                        });
+                        *gidx += 1;
+                    }
+                }
+            };
 
-                let same_line = (current_bounds[3] - item.bounds[3]).abs() < threshold_y
-                    || (current_bounds[1] - item.bounds[1]).abs() < threshold_y;
-                let close_x = item.bounds[0] - current_bounds[2] < threshold_x;
+            for item in &raw_chars {
+                // Newline/CR → flush current group
+                if item.ch == '\n' || item.ch == '\r' {
+                    flush(&mut objects, &current_text, &current_bounds, current_font_size, &mut group_idx);
+                    current_text.clear();
+                    current_bounds = None;
+                    current_font_size = 0.0;
+                    continue;
+                }
 
-                if same_line && close_x {
-                    // Check if we need a space between items
-                    let gap = item.bounds[0] - current_bounds[2];
-                    let space_threshold = ref_height * 0.25;
-                    if gap > space_threshold {
+                // Space/tab → add space to current text, don't update bounds
+                if item.ch == ' ' || item.ch == '\t' {
+                    if !current_text.is_empty() && !current_text.ends_with(' ') {
                         current_text.push(' ');
                     }
-                    current_bounds[0] = current_bounds[0].min(item.bounds[0]);
-                    current_bounds[1] = current_bounds[1].min(item.bounds[1]);
-                    current_bounds[2] = current_bounds[2].max(item.bounds[2]);
-                    current_bounds[3] = current_bounds[3].max(item.bounds[3]);
-                    current_text.push_str(&item.text);
+                    continue;
+                }
+
+                // Regular character — check whether it belongs on the current line
+                if let Some(char_bounds) = item.bounds {
+                    if let Some(ref cur_b) = current_bounds {
+                        let char_height = (char_bounds[3] - char_bounds[1]).max(0.5);
+                        let cur_height = (cur_b[3] - cur_b[1]).max(0.5);
+                        // Use the SMALLER height so mixed-size lines don't over-merge
+                        let ref_height = char_height.min(cur_height);
+                        let threshold_y = ref_height * 0.5;
+                        let threshold_x = cur_height.max(char_height) * 3.0;
+
+                        let same_line = (cur_b[3] - char_bounds[3]).abs() < threshold_y
+                            || (cur_b[1] - char_bounds[1]).abs() < threshold_y;
+                        let close_x = char_bounds[0] - cur_b[2] < threshold_x;
+
+                        if same_line && close_x {
+                            // Fallback gap-based space (for PDFs without generated spaces)
+                            let gap = char_bounds[0] - cur_b[2];
+                            if gap > ref_height * 0.3 && !current_text.ends_with(' ') {
+                                current_text.push(' ');
+                            }
+                            // Expand bounds
+                            current_bounds = Some([
+                                cur_b[0].min(char_bounds[0]),
+                                cur_b[1].min(char_bounds[1]),
+                                cur_b[2].max(char_bounds[2]),
+                                cur_b[3].max(char_bounds[3]),
+                            ]);
+                        } else {
+                            // Different line — flush and start new group
+                            flush(&mut objects, &current_text, &current_bounds, current_font_size, &mut group_idx);
+                            current_bounds = Some(char_bounds);
+                            current_text = String::new();
+                            current_font_size = 0.0;
+                        }
+                    } else {
+                        // First char with bounds in this group
+                        current_bounds = Some(char_bounds);
+                    }
+                    current_text.push(item.ch);
                     if item.font_size > current_font_size {
                         current_font_size = item.font_size;
                     }
                 } else {
-                    objects.push(PageObjectInfo {
-                        index: 100_000 + group_idx,
-                        object_type: "text".to_string(),
-                        bounds: Some(current_bounds),
-                        image_width: None,
-                        image_height: None,
-                        text_content: Some(current_text.clone()),
-                        font_size: Some(current_font_size),
-                        children: Vec::new(),
-                        parent_index: None,
-                    });
-                    group_idx += 1;
-                    current_bounds = item.bounds;
-                    current_text = item.text.clone();
-                    current_font_size = item.font_size;
+                    // Char without bounds — just append to text
+                    current_text.push(item.ch);
                 }
             }
             // Push last group
-            objects.push(PageObjectInfo {
-                index: 100_000 + group_idx,
-                object_type: "text".to_string(),
-                bounds: Some(current_bounds),
-                image_width: None,
-                image_height: None,
-                text_content: Some(current_text),
-                font_size: Some(current_font_size),
-                children: Vec::new(),
-                parent_index: None,
-            });
+            flush(&mut objects, &current_text, &current_bounds, current_font_size, &mut group_idx);
         }
 
         // Build parent/child relationships: form XObjects contain smaller objects
@@ -1021,13 +1077,17 @@ impl PdfDocument {
 
     /// Export a selected region of a page as an image.
     /// `bounds` is [left, bottom, right, top] in PDF points.
-    /// Renders with transparent background, crops to the specified region.
+    /// If `hide_text` is true, text objects are hidden before rendering.
+    /// If `transparent_bg` is true, the background is transparent; otherwise white.
     pub fn export_selected_region(
         &self,
         page_index: usize,
         bounds: [f64; 4],
         output_path: impl AsRef<Path>,
         format: ImageFormat,
+        hide_text: bool,
+        transparent_bg: bool,
+        selected_object_indices: &[usize],
     ) -> Result<()> {
         let pdfium = get_pdfium()?;
         let document = pdfium
@@ -1037,13 +1097,34 @@ impl PdfDocument {
         let page = document.pages().get(page_index as u16)
             .map_err(|e| anyhow!("Failed to get page {}: {}", page_index, e))?;
 
+        // When transparent_bg is on, hide ALL objects except the selected ones
+        // so that the page background (white rect) doesn't cover the transparent clear.
+        // Otherwise, just hide text objects if requested.
+        if transparent_bg && !selected_object_indices.is_empty() {
+            let keep: HashSet<usize> = selected_object_indices.iter().copied().collect();
+            for (idx, mut obj) in page.objects().iter().enumerate() {
+                if !keep.contains(&idx) {
+                    let _ = obj.translate(PdfPoints::new(-100000.0), PdfPoints::new(-100000.0));
+                }
+            }
+        } else if hide_text {
+            for mut obj in page.objects().iter() {
+                if obj.object_type() == PdfPageObjectType::Text {
+                    let _ = obj.translate(PdfPoints::new(-100000.0), PdfPoints::new(-100000.0));
+                }
+            }
+        }
+
         let page_width = page.width().value as f64;
         let page_height = page.height().value as f64;
 
-        // Render at 3x resolution with transparent background for clean crop
+        // Render at 3x resolution
         let render_width = (page_width * 3.0) as i32;
-        let render_config = PdfRenderConfig::new()
+        let mut render_config = PdfRenderConfig::new()
             .set_target_width(render_width);
+        if transparent_bg {
+            render_config = render_config.set_clear_color(PdfColor::new(0, 0, 0, 0));
+        }
         let rendered = page.render_with_config(&render_config)
             .map_err(|e| anyhow!("Failed to render page: {}", e))?;
         let image = rendered.as_image();
@@ -1084,10 +1165,15 @@ impl PdfDocument {
 
     /// Crop a specific object's bounding box and return as base64 PNG.
     /// Used for drag-to-extract previews and quick exports.
+    /// If `hide_text` is true, text objects are hidden before rendering.
+    /// If `transparent_bg` is true, the background is transparent; otherwise white.
     pub fn export_object_cropped_base64(
         &self,
         page_index: usize,
         bounds: [f64; 4],
+        hide_text: bool,
+        transparent_bg: bool,
+        selected_object_indices: &[usize],
     ) -> Result<String> {
         let pdfium = get_pdfium()?;
         let document = pdfium
@@ -1097,12 +1183,33 @@ impl PdfDocument {
         let page = document.pages().get(page_index as u16)
             .map_err(|e| anyhow!("Failed to get page {}: {}", page_index, e))?;
 
+        // When transparent_bg is on, hide ALL objects except the selected ones
+        // so that the page background (white rect) doesn't cover the transparent clear.
+        // Otherwise, just hide text objects if requested.
+        if transparent_bg && !selected_object_indices.is_empty() {
+            let keep: HashSet<usize> = selected_object_indices.iter().copied().collect();
+            for (idx, mut obj) in page.objects().iter().enumerate() {
+                if !keep.contains(&idx) {
+                    let _ = obj.translate(PdfPoints::new(-100000.0), PdfPoints::new(-100000.0));
+                }
+            }
+        } else if hide_text {
+            for mut obj in page.objects().iter() {
+                if obj.object_type() == PdfPageObjectType::Text {
+                    let _ = obj.translate(PdfPoints::new(-100000.0), PdfPoints::new(-100000.0));
+                }
+            }
+        }
+
         let page_width = page.width().value as f64;
         let page_height = page.height().value as f64;
 
         let render_width = (page_width * 3.0) as i32;
-        let render_config = PdfRenderConfig::new()
+        let mut render_config = PdfRenderConfig::new()
             .set_target_width(render_width);
+        if transparent_bg {
+            render_config = render_config.set_clear_color(PdfColor::new(0, 0, 0, 0));
+        }
         let rendered = page.render_with_config(&render_config)
             .map_err(|e| anyhow!("Failed to render page: {}", e))?;
         let image = rendered.as_image();

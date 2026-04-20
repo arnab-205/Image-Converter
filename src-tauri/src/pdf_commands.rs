@@ -63,12 +63,24 @@ pub struct ExportSelectedRegionRequest {
     pub bounds: [f64; 4],
     pub output_path: String,
     pub format: String,
+    #[serde(default)]
+    pub hide_text: bool,
+    #[serde(default)]
+    pub transparent_bg: bool,
+    #[serde(default)]
+    pub selected_object_indices: Vec<usize>,
 }
 
 #[derive(Deserialize)]
 pub struct CropObjectRequest {
     pub page_index: usize,
     pub bounds: [f64; 4],
+    #[serde(default)]
+    pub hide_text: bool,
+    #[serde(default)]
+    pub transparent_bg: bool,
+    #[serde(default)]
+    pub selected_object_indices: Vec<usize>,
 }
 
 #[derive(Deserialize)]
@@ -390,6 +402,9 @@ pub fn pdf_export_selected_region(
             request.bounds,
             &request.output_path,
             format,
+            request.hide_text,
+            request.transparent_bg,
+            &request.selected_object_indices,
         )
         .map(|_| true)
         .map_err(|e| format!("Failed to export region: {}", e))
@@ -406,6 +421,9 @@ pub fn pdf_crop_object(
         pdf.export_object_cropped_base64(
             request.page_index,
             request.bounds,
+            request.hide_text,
+            request.transparent_bg,
+            &request.selected_object_indices,
         )
         .map_err(|e| format!("Failed to crop object: {}", e))
     })

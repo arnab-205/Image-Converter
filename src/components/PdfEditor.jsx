@@ -115,11 +115,12 @@ export default function PdfEditor({ onBack }) {
   const [extractedImages, setExtractedImages] = useState([]);
   const [imagesLoading, setImagesLoading] = useState(false);
   const [imagesSaveFormat, setImagesSaveFormat] = useState("png");
+  const [transparentBg, setTransparentBg] = useState(true);
   const [pageObjects, setPageObjects] = useState([]);
   const [hoveredObjectIdx, setHoveredObjectIdx] = useState(null);
   const [selectedObjectIndices, setSelectedObjectIndices] = useState(new Set());
   const [showObjectOverlay, setShowObjectOverlay] = useState(true);
-  const [objectFilter, setObjectFilter] = useState("all"); // all | image | text | path
+  const [objectFilter, setObjectFilter] = useState("all"); // all | image | text | path | exportable
   const imgRef = useRef(null);
   const canvasRef = useRef(null);
   const [imgNaturalSize, setImgNaturalSize] = useState({ w: 0, h: 0 });
@@ -129,6 +130,11 @@ export default function PdfEditor({ onBack }) {
 
   // Excluded child indices (for nested layer unselection)
   const [excludedChildren, setExcludedChildren] = useState(new Set());
+
+  // Marquee (lasso) selection state
+  const [marqueeActive, setMarqueeActive] = useState(false);
+  const [marqueeStart, setMarqueeStart] = useState(null); // {x, y} in display coords
+  const [marqueeEnd, setMarqueeEnd] = useState(null);     // {x, y} in display coords
 
   // Per-page download format for organize view
   const [downloadFormat, setDownloadFormat] = useState("png");
@@ -200,11 +206,12 @@ export default function PdfEditor({ onBack }) {
   const renderPage = useCallback(
     async (pageIndex, activeLayerIds, pagesOverride) => {
       const pgs = pagesOverride || pages;
-      if (!pgs.length) return;
+      if (!pgs.length || pageIndex >= pgs.length) return;
+      const page = pgs[pageIndex];
+      if (!page || !page.width) return;
 
       setIsLoading(true);
       try {
-        const page = pgs[pageIndex];
         // Render at higher resolution for text clarity (PNG).
         const renderWidth = Math.min(2400, Math.floor(page.width * 3));
         const aspectRatio = page.height / page.width;
@@ -387,7 +394,6 @@ export default function PdfEditor({ onBack }) {
       const newPages = await invoke("pdf_reorder_pages", { newOrder: order });
       setPages(newPages);
       setCurrentPageIndex(toIndex);
-      await renderPage(toIndex, activeLayers, newPages);
       loadThumbnails();
     } catch (err) {
       setError(`Reorder failed: ${err}`);
@@ -645,10 +651,48 @@ export default function PdfEditor({ onBack }) {
     });
   }, []);
 
-  // ── Compute union bounding box of selected objects ──
+  // ── Marquee selection complete: select all exportable objects in the drawn rectangle ──
+  const EXPORTABLE_TYPES = new Set(["image", "path", "shading"]);
+  const handleMarqueeComplete = useCallback((rectDisplay) => {
+    if (!imgRef.current || !pages[currentPageIndex]) return;
+    const displayW = imgRef.current.clientWidth;
+    const displayH = imgRef.current.clientHeight;
+    const pw = pages[currentPageIndex].width;
+    const ph = pages[currentPageIndex].height;
+    if (!displayW || !displayH || !pw || !ph) return;
+
+    const scaleX = displayW / pw;
+    const scaleY = displayH / ph;
+    const pageArea = pw * ph;
+
+    // Convert marquee display rect → PDF coords
+    const pdfLeft   = rectDisplay.x / scaleX;
+    const pdfRight  = (rectDisplay.x + rectDisplay.w) / scaleX;
+    const pdfTop    = ph - (rectDisplay.y / scaleY);
+    const pdfBottom = ph - ((rectDisplay.y + rectDisplay.h) / scaleY);
+
+    const selected = new Set();
+    for (const obj of pageObjects) {
+      if (!obj.bounds || !EXPORTABLE_TYPES.has(obj.object_type)) continue;
+      const [l, b, r, t] = obj.bounds;
+      // Filter out full-page backgrounds
+      const areaRatio = ((r - l) * (t - b)) / pageArea;
+      if (obj.object_type === "image" && areaRatio > 0.85) continue;
+      if (obj.object_type === "path" && areaRatio > 0.7) continue;
+      // Check overlap (intersection, not containment)
+      if (l < pdfRight && r > pdfLeft && b < pdfTop && t > pdfBottom) {
+        selected.add(obj.index);
+      }
+    }
+    if (selected.size > 0) {
+      setSelectedObjectIndices(selected);
+    }
+  }, [pageObjects, pages, currentPageIndex]);
+
+  // ── Compute union bounding box of selected objects (excludes text) ──
   const getSelectedBounds = useCallback(() => {
     const selected = pageObjects.filter(
-      (o) => selectedObjectIndices.has(o.index) && o.bounds
+      (o) => selectedObjectIndices.has(o.index) && o.bounds && o.object_type !== "text"
     );
     if (selected.length === 0) return null;
     let [minL, minB, maxR, maxT] = selected[0].bounds;
@@ -680,6 +724,9 @@ export default function PdfEditor({ onBack }) {
           bounds,
           output_path: outputPath,
           format: ext,
+          hide_text: true,
+          transparent_bg: transparentBg,
+          selected_object_indices: Array.from(selectedObjectIndices),
         },
       });
       setExportStatus(`Saved selected region to ${outputPath}`);
@@ -688,7 +735,7 @@ export default function PdfEditor({ onBack }) {
     } finally {
       setIsExporting(false);
     }
-  }, [isExporting, getSelectedBounds, pdfPath, currentPageIndex, imagesSaveFormat]);
+  }, [isExporting, getSelectedBounds, pdfPath, currentPageIndex, imagesSaveFormat, transparentBg, selectedObjectIndices]);
 
   // ── Toggle excluded child (for nested layer unselection) ──
   const toggleExcludedChild = useCallback((childIndex) => {
@@ -1033,6 +1080,32 @@ export default function PdfEditor({ onBack }) {
                       onHover={setHoveredObjectIdx}
                       onSelect={toggleObjectSelection}
                       filter={objectFilter}
+                      marqueeActive={marqueeActive}
+                      marqueeStart={marqueeStart}
+                      marqueeEnd={marqueeEnd}
+                      onMarqueeStart={(pos) => {
+                        setMarqueeActive(true);
+                        setMarqueeStart(pos);
+                        setMarqueeEnd(pos);
+                      }}
+                      onMarqueeMove={(pos) => {
+                        setMarqueeEnd(pos);
+                      }}
+                      onMarqueeEnd={() => {
+                        if (marqueeStart && marqueeEnd) {
+                          const mx = Math.min(marqueeStart.x, marqueeEnd.x);
+                          const my = Math.min(marqueeStart.y, marqueeEnd.y);
+                          const mw = Math.abs(marqueeEnd.x - marqueeStart.x);
+                          const mh = Math.abs(marqueeEnd.y - marqueeStart.y);
+                          if (mw > 5 && mh > 5) {
+                            handleMarqueeComplete({ x: mx, y: my, w: mw, h: mh });
+                            setObjectFilter("exportable");
+                          }
+                        }
+                        setMarqueeActive(false);
+                        setMarqueeStart(null);
+                        setMarqueeEnd(null);
+                      }}
                     />
                   )}
                 </div>
@@ -1321,6 +1394,7 @@ export default function PdfEditor({ onBack }) {
                           { key: "image", label: "Images", color: "text-emerald-400" },
                           { key: "text", label: "Text", color: "text-sky-400" },
                           { key: "path", label: "Shapes", color: "text-amber-400" },
+                          { key: "exportable", label: "Draw", color: "text-rose-400" },
                         ].map((f) => (
                           <button
                             key={f.key}
@@ -1350,6 +1424,16 @@ export default function PdfEditor({ onBack }) {
                           </span>
                         </div>
                       )}
+
+                      {/* Marquee draw hint for exportable mode */}
+                      {objectFilter === "exportable" && (
+                        <div className="flex items-center gap-1.5 px-2 py-1.5 rounded-md bg-rose-500/10 border border-rose-500/20">
+                          <svg className="w-3.5 h-3.5 text-rose-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M15.042 21.672L13.684 16.6m0 0l-2.51 2.225.569-9.47 5.227 7.917-3.286-.672zM12 2.25V4.5m5.834.166l-1.591 1.591M20.25 10.5H18M7.757 14.743l-1.59 1.59M6 10.5H3.75m4.007-4.243l-1.59-1.59" />
+                          </svg>
+                          <span className="text-[10px] text-rose-300/80">Draw a rectangle on the page to auto-select images, shapes & shadings in that area</span>
+                        </div>
+                      )}
                     </div>
 
                     {/* Object list — click to multi-select */}
@@ -1357,7 +1441,9 @@ export default function PdfEditor({ onBack }) {
                       <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
                         {pageObjects
                           .filter((o) => {
-                            if (objectFilter !== "all" && o.object_type !== objectFilter) return false;
+                            if (objectFilter === "exportable") {
+                              if (!["image", "path", "shading"].includes(o.object_type)) return false;
+                            } else if (objectFilter !== "all" && o.object_type !== objectFilter) return false;
                             // Hide full-page background images/paths from list
                             if (o.bounds && pages[currentPageIndex]) {
                               const [l, b, r, t] = o.bounds;
@@ -1520,14 +1606,55 @@ export default function PdfEditor({ onBack }) {
                           </div>
                         </div>
 
+                        {/* Background mode selector */}
+                        <div>
+                          <label className="block text-[10px] text-slate-500 mb-1">Background</label>
+                          <div className="grid grid-cols-2 gap-1">
+                            <button
+                              type="button"
+                              onClick={() => setTransparentBg(true)}
+                              className={`py-1.5 rounded text-[10px] font-semibold transition-colors ${
+                                transparentBg
+                                  ? "bg-rose-500/20 text-rose-400 ring-1 ring-rose-500/40"
+                                  : "bg-slate-800 text-slate-400 hover:bg-slate-700"
+                              }`}
+                            >
+                              Transparent
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setTransparentBg(false)}
+                              className={`py-1.5 rounded text-[10px] font-semibold transition-colors ${
+                                !transparentBg
+                                  ? "bg-rose-500/20 text-rose-400 ring-1 ring-rose-500/40"
+                                  : "bg-slate-800 text-slate-400 hover:bg-slate-700"
+                              }`}
+                            >
+                              As-is
+                            </button>
+                          </div>
+                          {transparentBg && imagesSaveFormat === "jpg" && (
+                            <p className="text-[9px] text-amber-400/70 mt-1">JPEG doesn't support transparency — will export with white background</p>
+                          )}
+                        </div>
+
                         {/* Export selected region */}
-                        <button
-                          onClick={handleExportSelected}
-                          disabled={isExporting}
-                          className="w-full py-2 rounded-lg text-xs font-semibold bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white transition-all active:scale-[0.97] shadow-lg shadow-rose-500/15 disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                          {isExporting ? "Exporting..." : `Export Selected as ${imagesSaveFormat.toUpperCase()}`}
-                        </button>
+                        {(() => {
+                          const hasExportable = pageObjects.some(
+                            (o) => selectedObjectIndices.has(o.index) && o.bounds && o.object_type !== "text"
+                          );
+                          return hasExportable ? (
+                            <button
+                              onClick={handleExportSelected}
+                              disabled={isExporting}
+                              className="w-full py-2 rounded-lg text-xs font-semibold bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white transition-all active:scale-[0.97] shadow-lg shadow-rose-500/15 disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              {isExporting ? "Exporting..." : `Export Selected as ${imagesSaveFormat.toUpperCase()}`}
+                            </button>
+                          ) : (
+                            <p className="text-[10px] text-slate-600 italic">Select images or shapes to export</p>
+                          );
+                        })()}
                       </div>
                     )}
 
@@ -1791,6 +1918,12 @@ function ObjectOverlay({
   onHover,
   onSelect,
   filter,
+  marqueeActive,
+  marqueeStart,
+  marqueeEnd,
+  onMarqueeStart,
+  onMarqueeMove,
+  onMarqueeEnd,
 }) {
   const displayW = imgEl.clientWidth;
   const displayH = imgEl.clientHeight;
@@ -1800,12 +1933,12 @@ function ObjectOverlay({
   const scaleY = displayH / pdfHeight;
   const pageArea = pdfWidth * pdfHeight;
 
-  // Filter out text objects (handled by TextLayer), then apply user filter
+  // Apply user filter — include text objects now
   const filtered = pageObjects.filter((obj) => {
     if (!obj.bounds) return false;
-    if (obj.object_type === "text") return false;
-    if (filter === "text") return false;
-    if (filter !== "all" && obj.object_type !== filter) return false;
+    if (filter === "exportable") {
+      if (!["image", "path", "shading"].includes(obj.object_type)) return false;
+    } else if (filter !== "all" && obj.object_type !== filter) return false;
     const [l, b, r, t] = obj.bounds;
     const areaRatio = ((r - l) * (t - b)) / pageArea;
     if (obj.object_type === "path" && areaRatio > 0.7) return false;
@@ -1883,6 +2016,7 @@ function ObjectOverlay({
         const isSelected = selectedIndices.has(obj.index);
         const isHighlighted = isHovered || isSelected;
         const isImage = obj.object_type === "image";
+        const isText = obj.object_type === "text";
 
         return (
           <div
@@ -1895,15 +2029,18 @@ function ObjectOverlay({
               height: `${h}px`,
               border: isImage
                 ? `${isHighlighted ? 2.5 : 1.5}px ${isSelected ? "solid" : "dashed"} ${colors.border}`
+                : isText
+                ? `${isHighlighted ? 2 : 1}px ${isSelected ? "solid" : "dashed"} ${colors.border}`
                 : `${isHighlighted ? 1.5 : 0.5}px solid ${colors.border}`,
-              backgroundColor: isHighlighted ? colors.hoverBg : (isImage ? colors.bg : "transparent"),
+              backgroundColor: isHighlighted ? colors.hoverBg : (isImage ? colors.bg : isText ? colors.bg : "transparent"),
               zIndex: 1,
               boxShadow: isSelected
                 ? `0 0 0 2px ${colors.border}, 0 0 16px ${colors.bg}`
                 : "none",
-              borderRadius: isImage ? "2px" : "0",
+              borderRadius: isImage ? "2px" : isText ? "2px" : "0",
             }}
           >
+
             {/* Selection checkmark */}
             {isSelected && (
               <div
@@ -1921,20 +2058,85 @@ function ObjectOverlay({
                 className="absolute -top-6 left-0 px-2 py-0.5 rounded text-[10px] font-semibold whitespace-nowrap shadow-lg"
                 style={{ backgroundColor: colors.border, color: "#0f172a", zIndex: 3 }}
               >
-                {isImage ? `${obj.image_width}×${obj.image_height}px` : `${obj.object_type} #${obj.index}`}
+                {isImage ? `${obj.image_width}×${obj.image_height}px`
+                  : isText && obj.text_content ? obj.text_content.slice(0, 50) + (obj.text_content.length > 50 ? "…" : "")
+                  : `${obj.object_type} #${obj.index}`}
               </div>
             )}
           </div>
         );
       })}
 
-      {/* Transparent interactive click layer on top — handles all clicks via hit-testing */}
+      {/* Marquee rectangle visualization */}
+      {marqueeActive && marqueeStart && marqueeEnd && (() => {
+        const mx = Math.min(marqueeStart.x, marqueeEnd.x);
+        const my = Math.min(marqueeStart.y, marqueeEnd.y);
+        const mw = Math.abs(marqueeEnd.x - marqueeStart.x);
+        const mh = Math.abs(marqueeEnd.y - marqueeStart.y);
+        if (mw < 3 && mh < 3) return null;
+        return (
+          <div
+            className="absolute pointer-events-none"
+            style={{
+              left: `${mx}px`,
+              top: `${my}px`,
+              width: `${mw}px`,
+              height: `${mh}px`,
+              border: "2px dashed rgba(244, 63, 94, 0.8)",
+              backgroundColor: "rgba(244, 63, 94, 0.08)",
+              zIndex: 15,
+              borderRadius: "2px",
+            }}
+          />
+        );
+      })()}
+
+      {/* Transparent interactive layer — handles clicks + marquee draw */}
       <div
-        className="absolute inset-0 cursor-crosshair"
-        style={{ zIndex: 10 }}
-        onClick={handleOverlayClick}
-        onMouseMove={handleOverlayMove}
-        onMouseLeave={() => onHover(null)}
+        className="absolute inset-0"
+        style={{ zIndex: 10, cursor: "crosshair" }}
+        onClick={(e) => {
+          // Suppress click if a marquee drag just happened
+          if (e.currentTarget._wasMarqueeDrag) {
+            e.currentTarget._wasMarqueeDrag = false;
+            return;
+          }
+          handleOverlayClick(e);
+        }}
+        onMouseMove={(e) => {
+          if (marqueeActive && onMarqueeMove) {
+            const rect = e.currentTarget.getBoundingClientRect();
+            onMarqueeMove({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+          } else {
+            handleOverlayMove(e);
+          }
+        }}
+        onMouseDown={(e) => {
+          if (e.button !== 0) return;
+          if (onMarqueeStart) {
+            const rect = e.currentTarget.getBoundingClientRect();
+            onMarqueeStart({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+          }
+        }}
+        onMouseUp={(e) => {
+          if (marqueeActive && marqueeStart && marqueeEnd) {
+            const mw = Math.abs(marqueeEnd.x - marqueeStart.x);
+            const mh = Math.abs(marqueeEnd.y - marqueeStart.y);
+            if (mw > 5 || mh > 5) {
+              // This was a real marquee drag — flag to suppress the upcoming click
+              e.currentTarget._wasMarqueeDrag = true;
+            }
+          }
+          if (marqueeActive && onMarqueeEnd) {
+            onMarqueeEnd();
+          }
+        }}
+        onMouseLeave={() => {
+          onHover(null);
+          if (marqueeActive && onMarqueeEnd) {
+            onMarqueeEnd();
+          }
+        }}
       />
     </div>
   );
