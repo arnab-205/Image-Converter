@@ -1,0 +1,211 @@
+/* PdfPageManager.css - Styling for page management component */
+
+.page-manager-container {
+  padding: 20px;
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.page-manager-container h2 {
+  margin: 0 0 20px 0;
+  font-size: 20px;
+  color: #333;
+  border-bottom: 2px solid #007acc;
+  padding-bottom: 10px;
+}
+
+.page-manager-controls {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.page-manager-controls button {
+  padding: 10px 16px;
+  background: #007acc;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.page-manager-controls button:hover {
+  background: #005a9c;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.page-manager-controls button:active {
+  transform: scale(0.98);
+}
+
+.merge-btn::before {
+  content: '+ ';
+}
+
+.save-btn::before {
+  content: '💾 ';
+}
+
+.pages-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.page-grid-item {
+  cursor: grab;
+  transition: all 0.2s ease;
+  border: 2px solid transparent;
+  border-radius: 8px;
+  padding: 8px;
+  background: #fafafa;
+}
+
+.page-grid-item:active {
+  cursor: grabbing;
+}
+
+.page-grid-item.dragging {
+  opacity: 0.5;
+  border-color: #999;
+  background: #f0f0f0;
+}
+
+.page-grid-item.drag-over {
+  border-color: #007acc;
+  background: #e3f2fd;
+}
+
+.page-thumbnail-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  background: white;
+  border-radius: 6px;
+  padding: 8px;
+  transition: box-shadow 0.3s ease;
+}
+
+.page-grid-item:hover .page-thumbnail-item {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.page-number {
+  font-size: 12px;
+  font-weight: 600;
+  color: #666;
+  background: #f0f0f0;
+  padding: 4px 8px;
+  border-radius: 3px;
+  width: 100%;
+  text-align: center;
+}
+
+.page-content {
+  width: 100%;
+  aspect-ratio: 8.5 / 11;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f9f9f9;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.placeholder-thumbnail {
+  width: 90%;
+  height: 90%;
+  background: linear-gradient(135deg, #f0f0f0 50%, #e0e0e0 50%);
+  border-radius: 2px;
+}
+
+.remove-btn {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: #ff4444;
+  color: white;
+  border: none;
+  border-radius: 50%;
+  font-size: 16px;
+  font-weight: bold;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  opacity: 0;
+}
+
+.page-grid-item:hover .remove-btn {
+  opacity: 1;
+}
+
+.remove-btn:hover {
+  background: #cc0000;
+  transform: scale(1.1);
+}
+
+.remove-btn:active {
+  transform: scale(0.95);
+}
+
+.empty-message {
+  text-align: center;
+  color: #999;
+  font-size: 14px;
+  padding: 40px 20px;
+  background: #f9f9f9;
+  border: 2px dashed #ddd;
+  border-radius: 8px;
+}
+
+/* Responsive design */
+@media (max-width: 1200px) {
+  .pages-grid {
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 10px;
+  }
+}
+
+@media (max-width: 768px) {
+  .page-manager-container {
+    padding: 15px;
+  }
+
+  .page-manager-controls {
+    flex-direction: column;
+  }
+
+  .pages-grid {
+    grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+    gap: 8px;
+  }
+
+  .page-number {
+    font-size: 11px;
+  }
+}
+
+@media (max-width: 480px) {
+  .pages-grid {
+    grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+    gap: 6px;
+  }
+
+  .page-thumbnail-item {
+    padding: 6px;
+    gap: 6px;
+  }
+}

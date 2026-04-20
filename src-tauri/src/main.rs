@@ -7,12 +7,18 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
+use std::sync::Mutex;
 use std::thread; // Import the thread module
 use tauri::command;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_dialog::{DialogExt, FilePath}; // Add Deserialize
 
 use dirs;
+
+// PDF Processing Modules
+mod pdf_processor;
+mod pdf_commands;
+use pdf_commands::CurrentPdf;
 use image::codecs::gif::GifDecoder;
 use image::imageops::FilterType;
 use image::{AnimationDecoder, ImageDecoder, ImageFormat};
@@ -302,6 +308,22 @@ fn select_folder_from_backend(app: AppHandle) -> Result<Option<PathBuf>, String>
     match receiver.recv() {
         Ok(path) => Ok(path.and_then(|p| p.as_path().map(|path_ref| path_ref.to_path_buf()))),
         Err(_) => Err("Failed to receive folder path from dialog".to_string()),
+    }
+}
+
+#[command]
+fn select_pdf_file(app: AppHandle) -> Result<Option<String>, String> {
+    let (sender, receiver) = channel();
+    app.dialog()
+        .file()
+        .set_title("Open PDF")
+        .add_filter("PDF Files", &["pdf"])
+        .pick_file(move |file_path: Option<FilePath>| {
+            sender.send(file_path).unwrap();
+        });
+    match receiver.recv() {
+        Ok(path) => Ok(path.and_then(|p| p.as_path().map(|path_ref| path_ref.to_string_lossy().to_string()))),
+        Err(_) => Err("Failed to receive file path from dialog".to_string()),
     }
 }
 
@@ -637,7 +659,10 @@ fn process_and_save_image(
 }
 
 fn main() {
+    let current_pdf = CurrentPdf(Mutex::new(None));
+
     tauri::Builder::default()
+        .manage(current_pdf)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
@@ -645,8 +670,28 @@ fn main() {
             convert_single_image_from_path,
             prepare_drop,
             select_folder_from_backend,
+            select_pdf_file,
             get_image_thumbnails,
-            convert_all_images
+            convert_all_images,
+            // PDF handlers
+            pdf_commands::pdf_load,
+            pdf_commands::pdf_get_layers,
+            pdf_commands::pdf_get_pages,
+            pdf_commands::pdf_render_page,
+            pdf_commands::pdf_get_thumbnails,
+            pdf_commands::pdf_export_page,
+            pdf_commands::pdf_get_metadata,
+            pdf_commands::pdf_get_page_count,
+            pdf_commands::pdf_unload,
+            pdf_commands::pdf_delete_pages,
+            pdf_commands::pdf_reorder_pages,
+            pdf_commands::pdf_insert_blank_page,
+            pdf_commands::pdf_get_page_objects,
+            pdf_commands::pdf_extract_page_images,
+            pdf_commands::pdf_save_extracted_image,
+            pdf_commands::pdf_export_selected_region,
+            pdf_commands::pdf_crop_object,
+            pdf_commands::pdf_insert_image_as_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
