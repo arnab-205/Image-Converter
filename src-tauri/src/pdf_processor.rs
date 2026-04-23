@@ -341,6 +341,7 @@ impl PdfDocument {
         width: u32,
         _height: u32,
         _active_layers: Vec<String>,
+        hidden_object_indices: &[usize],
     ) -> Result<DynamicImage> {
         let pdfium = get_pdfium()?;
         let document = pdfium
@@ -349,6 +350,15 @@ impl PdfDocument {
 
         let page = document.pages().get(page_index as u16)
             .map_err(|e| anyhow!("Failed to get page {}: {}", page_index, e))?;
+
+        if !hidden_object_indices.is_empty() {
+            let hidden: HashSet<usize> = hidden_object_indices.iter().copied().collect();
+            for (idx, mut obj) in page.objects().iter().enumerate() {
+                if hidden.contains(&idx) {
+                    let _ = obj.translate(PdfPoints::new(-100000.0), PdfPoints::new(-100000.0));
+                }
+            }
+        }
 
         let render_page = page
             .render_with_config(
@@ -361,7 +371,7 @@ impl PdfDocument {
 
     /// Render a small thumbnail
     pub fn render_thumbnail(&self, page_index: usize, thumb_width: u32) -> Result<DynamicImage> {
-        self.render_page_to_image(page_index, thumb_width, 0, vec![])
+        self.render_page_to_image(page_index, thumb_width, 0, vec![], &[])
     }
 
     pub fn render_page_to_file(
@@ -372,7 +382,7 @@ impl PdfDocument {
         height: u32,
         format: ImageFormat,
     ) -> Result<()> {
-        let image = self.render_page_to_image(page_index, width, height, vec![])?;
+        let image = self.render_page_to_image(page_index, width, height, vec![], &[])?;
         match format {
             ImageFormat::Png => image.save_with_format(&output_path, image::ImageFormat::Png)?,
             ImageFormat::Jpeg => image.save_with_format(&output_path, image::ImageFormat::Jpeg)?,
@@ -1097,10 +1107,10 @@ impl PdfDocument {
         let page = document.pages().get(page_index as u16)
             .map_err(|e| anyhow!("Failed to get page {}: {}", page_index, e))?;
 
-        // When transparent_bg is on, hide ALL objects except the selected ones
-        // so that the page background (white rect) doesn't cover the transparent clear.
-        // Otherwise, just hide text objects if requested.
-        if transparent_bg && !selected_object_indices.is_empty() {
+        // If explicit selection is provided, always hide ALL non-selected objects
+        // so export contains only what the user selected (for both Transparent and As-is).
+        // If no explicit selection is provided, keep legacy hide_text behavior.
+        if !selected_object_indices.is_empty() {
             let keep: HashSet<usize> = selected_object_indices.iter().copied().collect();
             for (idx, mut obj) in page.objects().iter().enumerate() {
                 if !keep.contains(&idx) {
@@ -1183,10 +1193,10 @@ impl PdfDocument {
         let page = document.pages().get(page_index as u16)
             .map_err(|e| anyhow!("Failed to get page {}: {}", page_index, e))?;
 
-        // When transparent_bg is on, hide ALL objects except the selected ones
-        // so that the page background (white rect) doesn't cover the transparent clear.
-        // Otherwise, just hide text objects if requested.
-        if transparent_bg && !selected_object_indices.is_empty() {
+        // If explicit selection is provided, always hide ALL non-selected objects
+        // so export contains only what the user selected (for both Transparent and As-is).
+        // If no explicit selection is provided, keep legacy hide_text behavior.
+        if !selected_object_indices.is_empty() {
             let keep: HashSet<usize> = selected_object_indices.iter().copied().collect();
             for (idx, mut obj) in page.objects().iter().enumerate() {
                 if !keep.contains(&idx) {

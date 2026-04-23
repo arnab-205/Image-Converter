@@ -25,6 +25,8 @@ pub struct RenderPageRequest {
     pub width: u32,
     pub height: u32,
     pub active_layers: Option<Vec<String>>,
+    #[serde(default)]
+    pub hidden_object_indices: Vec<usize>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +107,25 @@ where
         }
         None => Err("No PDF loaded".to_string()),
     }
+}
+
+fn current_pdf_path(state: &State<'_, CurrentPdf>) -> Result<String, String> {
+    let lock = state.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    lock.clone().ok_or_else(|| "No PDF loaded".to_string())
+}
+
+async fn with_pdf_blocking<F, T>(path: String, task: F) -> Result<T, String>
+where
+    F: FnOnce(PdfDocument) -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let pdf = PdfDocument::load(&path)
+            .map_err(|e| format!("Failed to load PDF: {}", e))?;
+        task(pdf)
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {}", e))?
 }
 
 fn encode_image_jpeg_base64(image: &image::DynamicImage) -> Result<String, String> {
@@ -190,6 +211,7 @@ pub fn pdf_render_page(
             request.width,
             request.height,
             request.active_layers.clone().unwrap_or_default(),
+            &request.hidden_object_indices,
         ) {
             Ok(image) => {
                 let data_uri = encode_image_png_base64(&image)?;
@@ -241,18 +263,19 @@ pub fn pdf_get_thumbnails(
 }
 
 #[tauri::command]
-pub fn pdf_export_page(
+pub async fn pdf_export_page(
     request: ExportPageRequest,
     state: State<'_, CurrentPdf>,
 ) -> Result<bool, String> {
-    with_pdf(&state, |pdf| {
-        let format = match request.format.to_lowercase().as_str() {
-            "png" => ImageFormat::Png,
-            "jpg" | "jpeg" => ImageFormat::Jpeg,
-            "webp" => ImageFormat::WebP,
-            _ => return Err(format!("Unsupported format: {}", request.format)),
-        };
+    let path = current_pdf_path(&state)?;
+    let format = match request.format.to_lowercase().as_str() {
+        "png" => ImageFormat::Png,
+        "jpg" | "jpeg" => ImageFormat::Jpeg,
+        "webp" => ImageFormat::WebP,
+        _ => return Err(format!("Unsupported format: {}", request.format)),
+    };
 
+    with_pdf_blocking(path, move |pdf| {
         pdf.render_page_to_file(
             request.page_index,
             &request.output_path,
@@ -263,6 +286,7 @@ pub fn pdf_export_page(
         .map(|_| true)
         .map_err(|e| format!("Failed to export page: {}", e))
     })
+    .await
 }
 
 #[tauri::command]
@@ -348,22 +372,25 @@ pub fn pdf_get_page_objects(
 /// Extract all images embedded in a specific page.
 /// Returns a list of images with base64-encoded PNG data.
 #[tauri::command]
-pub fn pdf_extract_page_images(
+pub async fn pdf_extract_page_images(
     page_index: usize,
     state: State<'_, CurrentPdf>,
 ) -> Result<Vec<ExtractedImage>, String> {
-    with_pdf(&state, |pdf| {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
         pdf.extract_page_images(page_index)
             .map_err(|e| format!("Failed to extract images: {}", e))
     })
+    .await
 }
 
 /// Save a single extracted image to disk.
 #[tauri::command]
-pub fn pdf_save_extracted_image(
+pub async fn pdf_save_extracted_image(
     request: SaveExtractedImageRequest,
     state: State<'_, CurrentPdf>,
 ) -> Result<bool, String> {
+    let path = current_pdf_path(&state)?;
     let format = match request.format.to_lowercase().as_str() {
         "png" => ImageFormat::Png,
         "jpg" | "jpeg" => ImageFormat::Jpeg,
@@ -371,7 +398,7 @@ pub fn pdf_save_extracted_image(
         _ => return Err(format!("Unsupported format: {}", request.format)),
     };
 
-    with_pdf(&state, |pdf| {
+    with_pdf_blocking(path, move |pdf| {
         pdf.save_extracted_image(
             request.page_index,
             request.object_index,
@@ -381,14 +408,16 @@ pub fn pdf_save_extracted_image(
         .map(|_| true)
         .map_err(|e| format!("Failed to save image: {}", e))
     })
+    .await
 }
 
 /// Export a selected region of a page as an image (crop to union bounding box).
 #[tauri::command]
-pub fn pdf_export_selected_region(
+pub async fn pdf_export_selected_region(
     request: ExportSelectedRegionRequest,
     state: State<'_, CurrentPdf>,
 ) -> Result<bool, String> {
+    let path = current_pdf_path(&state)?;
     let format = match request.format.to_lowercase().as_str() {
         "png" => ImageFormat::Png,
         "jpg" | "jpeg" => ImageFormat::Jpeg,
@@ -396,7 +425,7 @@ pub fn pdf_export_selected_region(
         _ => return Err(format!("Unsupported format: {}", request.format)),
     };
 
-    with_pdf(&state, |pdf| {
+    with_pdf_blocking(path, move |pdf| {
         pdf.export_selected_region(
             request.page_index,
             request.bounds,
@@ -409,15 +438,17 @@ pub fn pdf_export_selected_region(
         .map(|_| true)
         .map_err(|e| format!("Failed to export region: {}", e))
     })
+    .await
 }
 
 /// Crop a specific object's bounding box and return as base64 PNG (for drag-to-extract).
 #[tauri::command]
-pub fn pdf_crop_object(
+pub async fn pdf_crop_object(
     request: CropObjectRequest,
     state: State<'_, CurrentPdf>,
 ) -> Result<String, String> {
-    with_pdf(&state, |pdf| {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
         pdf.export_object_cropped_base64(
             request.page_index,
             request.bounds,
@@ -427,6 +458,7 @@ pub fn pdf_crop_object(
         )
         .map_err(|e| format!("Failed to crop object: {}", e))
     })
+    .await
 }
 
 /// Insert an image file as a new PDF page at the specified position.

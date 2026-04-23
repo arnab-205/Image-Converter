@@ -94,6 +94,366 @@ const IconImageAdd = () => (
     <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v6m3-3h-6" strokeWidth={2.5} />
   </svg>
 );
+const IconEye = () => (
+  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 12s3.75-7.5 9.75-7.5S21.75 12 21.75 12s-3.75 7.5-9.75 7.5S2.25 12 2.25 12z" />
+    <circle cx="12" cy="12" r="3" />
+  </svg>
+);
+const IconEyeOff = () => (
+  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M3 3l18 18" />
+    <path strokeLinecap="round" strokeLinejoin="round" d="M10.58 10.58a2 2 0 102.83 2.83" />
+    <path strokeLinecap="round" strokeLinejoin="round" d="M9.88 5.08A10.56 10.56 0 0112 4.5c6 0 9.75 7.5 9.75 7.5a15.64 15.64 0 01-4.04 4.77M6.1 6.1A15.74 15.74 0 002.25 12s3.75 7.5 9.75 7.5a10.9 10.9 0 005.04-1.25" />
+  </svg>
+);
+
+const GROUPABLE_OBJECT_TYPES = new Set(["path", "shading", "form"]);
+const GROUP_CLUSTER_TYPES = new Set(["path", "shading"]);
+const SHAPE_OBJECT_TYPES = new Set(["path", "shading", "form"]);
+const MANUAL_GROUPS_STORAGE_PREFIX = "pdf-editor-manual-groups:";
+
+function getManualGroupsStorageKey(pdfPath) {
+  return `${MANUAL_GROUPS_STORAGE_PREFIX}${pdfPath}`;
+}
+
+function loadSavedManualGroups(pdfPath) {
+  if (!pdfPath || typeof window === "undefined" || !window.localStorage) return {};
+
+  try {
+    const raw = window.localStorage.getItem(getManualGroupsStorageKey(pdfPath));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+
+    return Object.fromEntries(
+      Object.entries(parsed)
+        .map(([pageKey, groups]) => {
+          if (!Array.isArray(groups)) return [pageKey, []];
+          const normalizedGroups = groups
+            .filter((group) => group && Array.isArray(group.memberIndices))
+            .map((group, index) => ({
+              id: typeof group.id === "string" ? group.id : `manual-${pageKey}-${index}`,
+              label: typeof group.label === "string" && group.label.trim() ? group.label : `Manual Group ${index + 1}`,
+              memberIndices: Array.from(new Set(group.memberIndices.filter((idx) => Number.isInteger(idx)))).sort((a, b) => a - b),
+            }))
+            .filter((group) => group.memberIndices.length >= 2);
+          return [pageKey, normalizedGroups];
+        })
+        .filter(([, groups]) => groups.length > 0),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function persistManualGroups(pdfPath, manualGroupsByPage) {
+  if (!pdfPath || typeof window === "undefined" || !window.localStorage) return;
+
+  try {
+    const normalized = Object.fromEntries(
+      Object.entries(manualGroupsByPage)
+        .map(([pageKey, groups]) => {
+          if (!Array.isArray(groups)) return [pageKey, []];
+          const serializableGroups = groups
+            .filter((group) => group && Array.isArray(group.memberIndices))
+            .map((group, index) => ({
+              id: typeof group.id === "string" ? group.id : `manual-${pageKey}-${index}`,
+              label: typeof group.label === "string" && group.label.trim() ? group.label : `Manual Group ${index + 1}`,
+              memberIndices: Array.from(new Set(group.memberIndices.filter((idx) => Number.isInteger(idx)))).sort((a, b) => a - b),
+            }))
+            .filter((group) => group.memberIndices.length >= 2);
+          return [pageKey, serializableGroups];
+        })
+        .filter(([, groups]) => groups.length > 0),
+    );
+
+    const storageKey = getManualGroupsStorageKey(pdfPath);
+    if (Object.keys(normalized).length === 0) {
+      window.localStorage.removeItem(storageKey);
+      return;
+    }
+
+    window.localStorage.setItem(storageKey, JSON.stringify(normalized));
+  } catch {
+    // Ignore persistence failures; manual groups still work for the current session.
+  }
+}
+
+function getObjectByIndex(pageObjects, idx) {
+  return pageObjects.find((obj) => obj.index === idx) || null;
+}
+
+function boundsAreRelated(boundsA, boundsB) {
+  if (!boundsA || !boundsB) return false;
+
+  const [leftA, bottomA, rightA, topA] = boundsA;
+  const [leftB, bottomB, rightB, topB] = boundsB;
+  const widthA = Math.max(0.0001, rightA - leftA);
+  const heightA = Math.max(0.0001, topA - bottomA);
+  const widthB = Math.max(0.0001, rightB - leftB);
+  const heightB = Math.max(0.0001, topB - bottomB);
+  const areaA = widthA * heightA;
+  const areaB = widthB * heightB;
+  const tol = 1.0;
+
+  const containsA =
+    leftB >= leftA - tol &&
+    bottomB >= bottomA - tol &&
+    rightB <= rightA + tol &&
+    topB <= topA + tol;
+  const containsB =
+    leftA >= leftB - tol &&
+    bottomA >= bottomB - tol &&
+    rightA <= rightB + tol &&
+    topA <= topB + tol;
+
+  const interLeft = Math.max(leftA, leftB);
+  const interBottom = Math.max(bottomA, bottomB);
+  const interRight = Math.min(rightA, rightB);
+  const interTop = Math.min(topA, topB);
+  const interWidth = Math.max(0, interRight - interLeft);
+  const interHeight = Math.max(0, interTop - interBottom);
+  const interArea = interWidth * interHeight;
+  const overlapRatio = interArea / Math.min(areaA, areaB);
+
+  const gapX = Math.max(0, Math.max(leftA, leftB) - Math.min(rightA, rightB));
+  const gapY = Math.max(0, Math.max(bottomA, bottomB) - Math.min(topA, topB));
+  const closeEnough =
+    gapX <= Math.max(2, Math.min(widthA, widthB) * 0.35) &&
+    gapY <= Math.max(2, Math.min(heightA, heightB) * 0.35);
+
+  const sizeRatio = Math.max(areaA, areaB) / Math.min(areaA, areaB);
+
+  return containsA || containsB || overlapRatio > 0.55 || (closeEnough && sizeRatio < 12);
+}
+
+function getBoundsMetrics(bounds) {
+  const [left, bottom, right, top] = bounds;
+  const width = Math.max(0.0001, right - left);
+  const height = Math.max(0.0001, top - bottom);
+  const area = width * height;
+  const centerX = left + width / 2;
+  const centerY = bottom + height / 2;
+  return { left, bottom, right, top, width, height, area, centerX, centerY };
+}
+
+function expandedBoundsOverlap(boundsA, boundsB, padding) {
+  const a = getBoundsMetrics(boundsA);
+  const b = getBoundsMetrics(boundsB);
+  return !(
+    a.right + padding < b.left ||
+    b.right + padding < a.left ||
+    a.top + padding < b.bottom ||
+    b.top + padding < a.bottom
+  );
+}
+
+function areObjectsStructurallyRelated(objA, objB) {
+  if (!objA || !objB) return false;
+  if (objA.index === objB.index) return true;
+
+  const aChildren = Array.isArray(objA.children) ? objA.children : [];
+  const bChildren = Array.isArray(objB.children) ? objB.children : [];
+
+  if (aChildren.includes(objB.index) || bChildren.includes(objA.index)) return true;
+  if (objA.parent_index != null && objA.parent_index === objB.index) return true;
+  if (objB.parent_index != null && objB.parent_index === objA.index) return true;
+  if (objA.parent_index != null && objA.parent_index === objB.parent_index) return true;
+
+  return false;
+}
+
+function areObjectsInSameLocalGroup(objA, objB) {
+  if (!objA?.bounds || !objB?.bounds) return false;
+  if (!GROUP_CLUSTER_TYPES.has(objA.object_type) || !GROUP_CLUSTER_TYPES.has(objB.object_type)) {
+    return false;
+  }
+
+  const metricsA = getBoundsMetrics(objA.bounds);
+  const metricsB = getBoundsMetrics(objB.bounds);
+  const sizeRatio = Math.max(metricsA.area, metricsB.area) / Math.min(metricsA.area, metricsB.area);
+  if (sizeRatio > 10) return false;
+
+  const interLeft = Math.max(metricsA.left, metricsB.left);
+  const interBottom = Math.max(metricsA.bottom, metricsB.bottom);
+  const interRight = Math.min(metricsA.right, metricsB.right);
+  const interTop = Math.min(metricsA.top, metricsB.top);
+  const interWidth = Math.max(0, interRight - interLeft);
+  const interHeight = Math.max(0, interTop - interBottom);
+  const interArea = interWidth * interHeight;
+  const overlapRatio = interArea / Math.min(metricsA.area, metricsB.area);
+
+  if (overlapRatio > 0.2) return true;
+
+  const padding = Math.min(
+    8,
+    Math.max(1.5, Math.min(metricsA.width, metricsA.height, metricsB.width, metricsB.height) * 0.5),
+  );
+  if (!expandedBoundsOverlap(objA.bounds, objB.bounds, padding)) return false;
+
+  const deltaX = Math.abs(metricsA.centerX - metricsB.centerX);
+  const deltaY = Math.abs(metricsA.centerY - metricsB.centerY);
+  const nearInX = deltaX <= Math.max(metricsA.width, metricsB.width) * 1.25 + 4;
+  const nearInY = deltaY <= Math.max(metricsA.height, metricsB.height) * 1.25 + 4;
+
+  return nearInX && nearInY;
+}
+
+function createGroupDefinition(pageObjects, memberIndices, index, options = {}) {
+  const { id, label, isManual = false, skipDensityCheck = false, densityThreshold = 0.08 } = options;
+  const normalizedIndices = Array.from(new Set(memberIndices)).sort((a, b) => a - b);
+  const members = normalizedIndices
+    .map((memberIdx) => getObjectByIndex(pageObjects, memberIdx))
+    .filter((member) => member?.bounds);
+
+  if (members.length < 2) return null;
+
+  const union = members.reduce((acc, member) => {
+    const metrics = getBoundsMetrics(member.bounds);
+    return {
+      left: Math.min(acc.left, metrics.left),
+      bottom: Math.min(acc.bottom, metrics.bottom),
+      right: Math.max(acc.right, metrics.right),
+      top: Math.max(acc.top, metrics.top),
+      totalArea: acc.totalArea + metrics.area,
+    };
+  }, {
+    left: Number.POSITIVE_INFINITY,
+    bottom: Number.POSITIVE_INFINITY,
+    right: Number.NEGATIVE_INFINITY,
+    top: Number.NEGATIVE_INFINITY,
+    totalArea: 0,
+  });
+
+  const unionArea = Math.max(0.0001, (union.right - union.left) * (union.top - union.bottom));
+  const density = union.totalArea / unionArea;
+  if (!skipDensityCheck && density < densityThreshold) return null;
+
+  const pathCount = members.filter((member) => member.object_type === "path").length;
+  const shadingCount = members.filter((member) => member.object_type === "shading").length;
+  const formCount = members.filter((member) => member.object_type === "form").length;
+
+  let resolvedLabel = label;
+  if (!resolvedLabel) {
+    if (isManual) {
+      resolvedLabel = `Manual Group ${index + 1}`;
+    } else if (pathCount > 0 && shadingCount === 0 && formCount === 0) {
+      resolvedLabel = `Path Group ${index + 1}`;
+    } else if (formCount > 0 && pathCount === 0 && shadingCount === 0) {
+      resolvedLabel = `Form Group ${index + 1}`;
+    } else {
+      resolvedLabel = `Group ${index + 1}`;
+    }
+  }
+
+  return {
+    id: id || `${isManual ? "manual" : "group"}-${index}`,
+    label: resolvedLabel,
+    memberIndices: normalizedIndices,
+    members,
+    isManual,
+  };
+}
+
+function getVisibilityBundleIndicesForObjects(pageObjects, idx) {
+  const target = getObjectByIndex(pageObjects, idx);
+  if (!target) return [idx];
+
+  const bundle = new Set([idx]);
+
+  if (target.parent_index != null) {
+    bundle.add(target.parent_index);
+  }
+  if (target.children && target.children.length > 0) {
+    for (const childIdx of target.children) {
+      bundle.add(childIdx);
+    }
+  }
+
+  if (!target.bounds) {
+    return Array.from(bundle);
+  }
+
+  const targetIsVectorLike = GROUPABLE_OBJECT_TYPES.has(target.object_type);
+
+  for (const candidate of pageObjects) {
+    if (candidate.index === idx || !candidate.bounds) continue;
+
+    const sameParent =
+      target.parent_index != null && candidate.parent_index === target.parent_index;
+    const parentChildLink =
+      candidate.index === target.parent_index || candidate.parent_index === target.index;
+    const candidateIsVectorLike = GROUPABLE_OBJECT_TYPES.has(candidate.object_type);
+
+    if (!(targetIsVectorLike && candidateIsVectorLike) && !sameParent && !parentChildLink) {
+      continue;
+    }
+
+    if (sameParent || parentChildLink || boundsAreRelated(target.bounds, candidate.bounds)) {
+      bundle.add(candidate.index);
+    }
+  }
+
+  return Array.from(bundle);
+}
+
+function buildObjectGroups(pageObjects, manualGroups = []) {
+  const candidates = pageObjects.filter(
+    (obj) => GROUP_CLUSTER_TYPES.has(obj.object_type) && obj.bounds,
+  );
+  const visited = new Set();
+  const groups = [];
+
+  for (const candidate of candidates) {
+    if (visited.has(candidate.index)) continue;
+
+    const stack = [candidate.index];
+    const component = new Set();
+
+    while (stack.length > 0) {
+      const currentIdx = stack.pop();
+      if (visited.has(currentIdx)) continue;
+      visited.add(currentIdx);
+      component.add(currentIdx);
+
+      const current = getObjectByIndex(pageObjects, currentIdx);
+      if (!current?.bounds) continue;
+
+      for (const other of candidates) {
+        if (visited.has(other.index) || other.index === currentIdx) continue;
+        if (areObjectsInSameLocalGroup(current, other)) {
+          stack.push(other.index);
+        }
+      }
+    }
+
+    if (component.size >= 2) {
+      groups.push(component);
+    }
+  }
+
+  const normalizedManualGroups = manualGroups
+    .map((group, index) => createGroupDefinition(pageObjects, group.memberIndices, index, {
+      id: group.id,
+      label: group.label,
+      isManual: true,
+      skipDensityCheck: true,
+    }))
+    .filter(Boolean);
+
+  const manualMemberSet = new Set(normalizedManualGroups.flatMap((group) => group.memberIndices));
+
+  const autoGroups = groups
+    .map((set, index) => createGroupDefinition(
+      pageObjects,
+      Array.from(set).filter((memberIdx) => !manualMemberSet.has(memberIdx)),
+      index,
+    ))
+    .filter(Boolean);
+
+  return [...normalizedManualGroups, ...autoGroups];
+}
 
 export default function PdfEditor({ onBack }) {
   const [pdfPath, setPdfPath] = useState("");
@@ -118,9 +478,13 @@ export default function PdfEditor({ onBack }) {
   const [transparentBg, setTransparentBg] = useState(true);
   const [pageObjects, setPageObjects] = useState([]);
   const [hoveredObjectIdx, setHoveredObjectIdx] = useState(null);
+  const [hoveredGroupIndices, setHoveredGroupIndices] = useState(new Set());
   const [selectedObjectIndices, setSelectedObjectIndices] = useState(new Set());
+  const [hiddenObjectIndices, setHiddenObjectIndices] = useState(new Set());
   const [showObjectOverlay, setShowObjectOverlay] = useState(true);
   const [objectFilter, setObjectFilter] = useState("all"); // all | image | text | path | exportable
+  const [layerViewMode, setLayerViewMode] = useState("objects"); // objects | groups
+  const [manualGroupsByPage, setManualGroupsByPage] = useState({});
   const imgRef = useRef(null);
   const canvasRef = useRef(null);
   const [imgNaturalSize, setImgNaturalSize] = useState({ w: 0, h: 0 });
@@ -147,8 +511,18 @@ export default function PdfEditor({ onBack }) {
   const isDraggingRef = useRef(false);
   const dragStartPos = useRef({ x: 0, y: 0 });
   const dragFromIdxRef = useRef(null);
+  const renderRequestIdRef = useRef(0);
+  const hiddenPreviewTimeoutRef = useRef(null);
+  const lastHiddenSignatureRef = useRef("");
+  const objectRowRefs = useRef(new Map());
+  const pendingSidebarFocusIdxRef = useRef(null);
 
   const isLoaded = !!metadata;
+  const waitForNextPaint = useCallback(
+    () => new Promise((resolve) => requestAnimationFrame(() => resolve())),
+    [],
+  );
+  const manualGroupsForPage = manualGroupsByPage[currentPageIndex] || [];
 
   // ── Open PDF via native file dialog ──
   const handleOpenPdf = useCallback(async () => {
@@ -166,6 +540,7 @@ export default function PdfEditor({ onBack }) {
     setError("");
     setRenderedImage(null);
     setExportStatus("");
+    setManualGroupsByPage(loadSavedManualGroups(filePath));
 
     try {
       const response = await invoke("pdf_load", { filePath });
@@ -204,16 +579,24 @@ export default function PdfEditor({ onBack }) {
   };
 
   const renderPage = useCallback(
-    async (pageIndex, activeLayerIds, pagesOverride) => {
+    async (pageIndex, activeLayerIds, pagesOverride, options = {}) => {
+      const { suppressLoading = false } = options;
       const pgs = pagesOverride || pages;
       if (!pgs.length || pageIndex >= pgs.length) return;
       const page = pgs[pageIndex];
       if (!page || !page.width) return;
 
-      setIsLoading(true);
+      const requestId = ++renderRequestIdRef.current;
+
+      if (!suppressLoading) {
+        setIsLoading(true);
+      }
       try {
-        // Render at higher resolution for text clarity (PNG).
-        const renderWidth = Math.min(2400, Math.floor(page.width * 3));
+        // Use a lighter render for interactive layer editing to keep hide/show responsive.
+        const isInteractivePreview = activePanel === "images";
+        const renderScale = isInteractivePreview ? 2.15 : 3;
+        const renderCap = isInteractivePreview ? 1800 : 2400;
+        const renderWidth = Math.min(renderCap, Math.floor(page.width * renderScale));
         const aspectRatio = page.height / page.width;
         const renderHeight = Math.floor(renderWidth * aspectRatio);
         const response = await invoke("pdf_render_page", {
@@ -222,8 +605,11 @@ export default function PdfEditor({ onBack }) {
             width: renderWidth,
             height: renderHeight,
             active_layers: activeLayerIds || activeLayers,
+            hidden_object_indices: activePanel === "images" ? Array.from(hiddenObjectIndices) : [],
           },
         });
+
+        if (requestId !== renderRequestIdRef.current) return;
 
         if (response.success && response.image_data) {
           setRenderedImage(response.image_data);
@@ -231,13 +617,48 @@ export default function PdfEditor({ onBack }) {
           setError(response.message);
         }
       } catch (err) {
-        setError(`Render failed: ${err}`);
+        if (requestId === renderRequestIdRef.current) {
+          setError(`Render failed: ${err}`);
+        }
       } finally {
-        setIsLoading(false);
+        if (!suppressLoading && requestId === renderRequestIdRef.current) {
+          setIsLoading(false);
+        }
       }
     },
-    [pages, activeLayers],
+    [pages, activeLayers, activePanel, hiddenObjectIndices],
   );
+
+  useEffect(() => {
+    if (!isLoaded || activePanel !== "images") {
+      if (hiddenPreviewTimeoutRef.current) {
+        clearTimeout(hiddenPreviewTimeoutRef.current);
+        hiddenPreviewTimeoutRef.current = null;
+      }
+      lastHiddenSignatureRef.current = Array.from(hiddenObjectIndices).sort((a, b) => a - b).join(",");
+      return;
+    }
+
+    const hiddenSignature = Array.from(hiddenObjectIndices).sort((a, b) => a - b).join(",");
+    if (hiddenSignature === lastHiddenSignatureRef.current) return;
+    lastHiddenSignatureRef.current = hiddenSignature;
+
+    if (hiddenPreviewTimeoutRef.current) {
+      clearTimeout(hiddenPreviewTimeoutRef.current);
+    }
+
+    hiddenPreviewTimeoutRef.current = setTimeout(() => {
+      renderPage(currentPageIndex, activeLayers, undefined, { suppressLoading: true });
+      hiddenPreviewTimeoutRef.current = null;
+    }, 90);
+
+    return () => {
+      if (hiddenPreviewTimeoutRef.current) {
+        clearTimeout(hiddenPreviewTimeoutRef.current);
+        hiddenPreviewTimeoutRef.current = null;
+      }
+    };
+  }, [hiddenObjectIndices, activePanel, isLoaded, currentPageIndex, activeLayers, renderPage]);
 
   // ── Navigation ──
   const goToPreviousPage = useCallback(() => {
@@ -272,9 +693,10 @@ export default function PdfEditor({ onBack }) {
   const handleExportPage = useCallback(async () => {
     if (!pdfPath || isExporting) return;
     setIsExporting(true);
-    setExportStatus("");
+    setExportStatus("Preparing page export...");
     setError("");
     try {
+      await waitForNextPaint();
       const ts = Date.now();
       const outputPath = `${pdfPath}-page${currentPageIndex + 1}-${ts}.${exportFormat}`;
       const page = pages[currentPageIndex];
@@ -295,7 +717,7 @@ export default function PdfEditor({ onBack }) {
     } finally {
       setIsExporting(false);
     }
-  }, [pdfPath, currentPageIndex, pages, exportFormat, isExporting]);
+  }, [pdfPath, currentPageIndex, pages, exportFormat, isExporting, waitForNextPaint]);
 
   // ── Close PDF ──
   const handleClosePdf = useCallback(async () => {
@@ -317,9 +739,12 @@ export default function PdfEditor({ onBack }) {
     setExtractedImages([]);
     setPageObjects([]);
     setSelectedObjectIndices(new Set());
+    setHiddenObjectIndices(new Set());
     setHoveredObjectIdx(null);
+    setHoveredGroupIndices(new Set());
     setIsExporting(false);
     setExcludedChildren(new Set());
+    setManualGroupsByPage({});
   }, []);
 
   // ── Load thumbnails ──
@@ -580,9 +1005,16 @@ export default function PdfEditor({ onBack }) {
     try {
       const objs = await invoke("pdf_get_page_objects", { pageIndex });
       setPageObjects(objs);
+      setHiddenObjectIndices(new Set());
+      setSelectedObjectIndices(new Set());
+      setExcludedChildren(new Set());
+      setHoveredObjectIdx(null);
+      setHoveredGroupIndices(new Set());
     } catch (err) {
       console.error("Failed to get page objects:", err);
       setPageObjects([]);
+      setHiddenObjectIndices(new Set());
+      setHoveredGroupIndices(new Set());
     }
   }, []);
 
@@ -594,14 +1026,20 @@ export default function PdfEditor({ onBack }) {
     } else {
       setPageObjects([]);
       setSelectedObjectIndices(new Set());
+      setHiddenObjectIndices(new Set());
       setHoveredObjectIdx(null);
+      setHoveredGroupIndices(new Set());
     }
   }, [activePanel, currentPageIndex, isLoaded, fetchPageObjects]);
 
   // ── Save extracted image to disk ──
   const handleSaveExtractedImage = useCallback(async (objectIndex, imgIndex) => {
-    if (!pdfPath) return;
+    if (!pdfPath || isExporting) return;
+    setIsExporting(true);
+    setExportStatus(`Preparing image ${imgIndex + 1} export...`);
+    setError("");
     try {
+      await waitForNextPaint();
       const ext = imagesSaveFormat;
       const outputPath = `${pdfPath}-page${currentPageIndex + 1}-image${imgIndex + 1}.${ext}`;
       await invoke("pdf_save_extracted_image", {
@@ -615,17 +1053,24 @@ export default function PdfEditor({ onBack }) {
       setExportStatus(`Saved image to ${outputPath}`);
     } catch (err) {
       setError(`Save image failed: ${err}`);
+    } finally {
+      setIsExporting(false);
     }
-  }, [pdfPath, currentPageIndex, imagesSaveFormat]);
+  }, [pdfPath, currentPageIndex, imagesSaveFormat, isExporting, waitForNextPaint]);
 
   // ── Save all extracted images ──
   const handleSaveAllImages = useCallback(async () => {
-    if (!pdfPath || extractedImages.length === 0) return;
+    if (!pdfPath || extractedImages.length === 0 || isExporting) return;
+    setIsExporting(true);
+    setExportStatus(`Preparing ${extractedImages.length} image exports...`);
+    setError("");
     try {
+      await waitForNextPaint();
       for (let i = 0; i < extractedImages.length; i++) {
         const img = extractedImages[i];
         const ext = imagesSaveFormat;
         const outputPath = `${pdfPath}-page${currentPageIndex + 1}-image${i + 1}.${ext}`;
+        setExportStatus(`Saving image ${i + 1} of ${extractedImages.length}...`);
         await invoke("pdf_save_extracted_image", {
           request: {
             page_index: currentPageIndex,
@@ -638,18 +1083,124 @@ export default function PdfEditor({ onBack }) {
       setExportStatus(`Saved ${extractedImages.length} image(s) from page ${currentPageIndex + 1}`);
     } catch (err) {
       setError(`Save all images failed: ${err}`);
+    } finally {
+      setIsExporting(false);
     }
-  }, [pdfPath, currentPageIndex, extractedImages, imagesSaveFormat]);
+  }, [pdfPath, currentPageIndex, extractedImages, imagesSaveFormat, isExporting, waitForNextPaint]);
 
   // ── Toggle object selection (multi-select) ──
   const toggleObjectSelection = useCallback((idx) => {
+    if (hiddenObjectIndices.has(idx)) return;
     setSelectedObjectIndices((prev) => {
       const next = new Set(prev);
       if (next.has(idx)) next.delete(idx);
       else next.add(idx);
       return next;
     });
+  }, [hiddenObjectIndices]);
+
+  const handlePageObjectSelection = useCallback((idx) => {
+    if (hiddenObjectIndices.has(idx)) return;
+
+    const object = getObjectByIndex(pageObjects, idx);
+    const willSelect = !selectedObjectIndices.has(idx);
+
+    if (object && willSelect) {
+      setLayerViewMode("objects");
+
+      if (object.object_type === "text") {
+        setObjectFilter("text");
+      } else if (object.object_type === "image") {
+        setObjectFilter("image");
+      } else if (SHAPE_OBJECT_TYPES.has(object.object_type)) {
+        setObjectFilter("path");
+      } else {
+        setObjectFilter("all");
+      }
+
+      pendingSidebarFocusIdxRef.current = idx;
+    }
+
+    toggleObjectSelection(idx);
+  }, [hiddenObjectIndices, pageObjects, selectedObjectIndices, toggleObjectSelection]);
+
+  const getVisibilityBundleIndices = useCallback(
+    (idx) => getVisibilityBundleIndicesForObjects(pageObjects, idx),
+    [pageObjects],
+  );
+
+  const toggleGroupSelection = useCallback((memberIndices) => {
+    setSelectedObjectIndices((prev) => {
+      const next = new Set(prev);
+      const selectable = memberIndices.filter((idx) => !hiddenObjectIndices.has(idx));
+      if (selectable.length === 0) return next;
+      const allSelected = selectable.every((idx) => next.has(idx));
+      for (const idx of selectable) {
+        if (allSelected) next.delete(idx);
+        else next.add(idx);
+      }
+      return next;
+    });
+  }, [hiddenObjectIndices]);
+
+  const toggleGroupVisibility = useCallback((memberIndices) => {
+    setHiddenObjectIndices((prev) => {
+      const next = new Set(prev);
+      const shouldShow = memberIndices.some((idx) => next.has(idx));
+      for (const idx of memberIndices) {
+        if (shouldShow) next.delete(idx);
+        else next.add(idx);
+      }
+      return next;
+    });
+
+    setSelectedObjectIndices((prev) => {
+      const next = new Set(prev);
+      for (const idx of memberIndices) {
+        next.delete(idx);
+      }
+      return next;
+    });
+    setExcludedChildren((prev) => {
+      const next = new Set(prev);
+      for (const idx of memberIndices) {
+        next.delete(idx);
+      }
+      return next;
+    });
+    setHoveredObjectIdx((prev) => (memberIndices.includes(prev) ? null : prev));
   }, []);
+
+  // ── Toggle object visibility (eye icon) ──
+  const toggleObjectVisibility = useCallback((idx) => {
+    const bundleIndices = getVisibilityBundleIndices(idx);
+    setHiddenObjectIndices((prev) => {
+      const next = new Set(prev);
+      const shouldShow = bundleIndices.some((bundleIdx) => next.has(bundleIdx));
+      for (const bundleIdx of bundleIndices) {
+        if (shouldShow) next.delete(bundleIdx);
+        else next.add(bundleIdx);
+      }
+      return next;
+    });
+
+    // Hidden objects should not remain selected/hovered.
+    setSelectedObjectIndices((prev) => {
+      const next = new Set(prev);
+      for (const bundleIdx of bundleIndices) {
+        next.delete(bundleIdx);
+      }
+      return next;
+    });
+    setExcludedChildren((prev) => {
+      const next = new Set(prev);
+      for (const bundleIdx of bundleIndices) {
+        next.delete(bundleIdx);
+      }
+      return next;
+    });
+    setHoveredObjectIdx((prev) => (bundleIndices.includes(prev) ? null : prev));
+  }, [getVisibilityBundleIndices]);
 
   // ── Marquee selection complete: select all exportable objects in the drawn rectangle ──
   const EXPORTABLE_TYPES = new Set(["image", "path", "shading"]);
@@ -673,6 +1224,7 @@ export default function PdfEditor({ onBack }) {
 
     const selected = new Set();
     for (const obj of pageObjects) {
+      if (hiddenObjectIndices.has(obj.index)) continue;
       if (!obj.bounds || !EXPORTABLE_TYPES.has(obj.object_type)) continue;
       const [l, b, r, t] = obj.bounds;
       // Filter out full-page backgrounds
@@ -687,12 +1239,28 @@ export default function PdfEditor({ onBack }) {
     if (selected.size > 0) {
       setSelectedObjectIndices(selected);
     }
-  }, [pageObjects, pages, currentPageIndex]);
+  }, [pageObjects, pages, currentPageIndex, hiddenObjectIndices]);
+
+  useEffect(() => {
+    if (activePanel !== "images" || layerViewMode !== "objects") return;
+
+    const targetIdx = pendingSidebarFocusIdxRef.current;
+    if (targetIdx == null || !selectedObjectIndices.has(targetIdx)) return;
+
+    const frameId = requestAnimationFrame(() => {
+      const row = objectRowRefs.current.get(targetIdx);
+      if (!row) return;
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      pendingSidebarFocusIdxRef.current = null;
+    });
+
+    return () => cancelAnimationFrame(frameId);
+  }, [activePanel, layerViewMode, objectFilter, selectedObjectIndices, currentPageIndex]);
 
   // ── Compute union bounding box of selected objects (excludes text) ──
   const getSelectedBounds = useCallback(() => {
     const selected = pageObjects.filter(
-      (o) => selectedObjectIndices.has(o.index) && o.bounds && o.object_type !== "text"
+      (o) => selectedObjectIndices.has(o.index) && !hiddenObjectIndices.has(o.index) && o.bounds && o.object_type !== "text"
     );
     if (selected.length === 0) return null;
     let [minL, minB, maxR, maxT] = selected[0].bounds;
@@ -704,20 +1272,154 @@ export default function PdfEditor({ onBack }) {
       maxT = Math.max(maxT, t);
     }
     return [minL, minB, maxR, maxT];
-  }, [pageObjects, selectedObjectIndices]);
+  }, [pageObjects, selectedObjectIndices, hiddenObjectIndices]);
+
+  const getMergeableSelectedIndices = useCallback(() => {
+    return pageObjects
+      .filter(
+        (obj) => selectedObjectIndices.has(obj.index)
+          && !hiddenObjectIndices.has(obj.index)
+          && obj.bounds
+          && obj.object_type === "path",
+      )
+      .map((obj) => obj.index)
+      .sort((a, b) => a - b);
+  }, [pageObjects, selectedObjectIndices, hiddenObjectIndices]);
+
+  const handleMergeSelectedIntoGroup = useCallback(() => {
+    const mergeableIndices = getMergeableSelectedIndices();
+    if (mergeableIndices.length < 2) return;
+
+    setManualGroupsByPage((prev) => {
+      const currentGroups = prev[currentPageIndex] || [];
+      const mergeSet = new Set(mergeableIndices);
+      const overlappingGroups = currentGroups.filter((group) =>
+        group.memberIndices.some((idx) => mergeSet.has(idx)),
+      );
+      const combinedIndices = Array.from(new Set([
+        ...mergeableIndices,
+        ...overlappingGroups.flatMap((group) => group.memberIndices),
+      ])).sort((a, b) => a - b);
+      const remainingGroups = currentGroups.filter((group) =>
+        !group.memberIndices.some((idx) => mergeSet.has(idx)),
+      );
+      const nextGroupCount = remainingGroups.length + 1;
+      const nextManualGroup = {
+        id: `manual-${currentPageIndex}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        label: `Manual Group ${nextGroupCount}`,
+        memberIndices: combinedIndices,
+      };
+
+      const nextManualGroupsByPage = {
+        ...prev,
+        [currentPageIndex]: [...remainingGroups, nextManualGroup],
+      };
+
+      persistManualGroups(pdfPath, nextManualGroupsByPage);
+
+      return nextManualGroupsByPage;
+    });
+
+    setLayerViewMode("groups");
+    setObjectFilter("path");
+    setExportStatus(`Saved manual group for page ${currentPageIndex + 1}`);
+  }, [currentPageIndex, getMergeableSelectedIndices, pdfPath]);
+
+  const handleUngroupManualGroup = useCallback((groupId) => {
+    setManualGroupsByPage((prev) => {
+      const currentGroups = prev[currentPageIndex] || [];
+      const nextGroups = currentGroups.filter((group) => group.id !== groupId);
+      if (nextGroups.length === 0) {
+        const { [currentPageIndex]: _removed, ...rest } = prev;
+        persistManualGroups(pdfPath, rest);
+        return rest;
+      }
+      const nextManualGroupsByPage = {
+        ...prev,
+        [currentPageIndex]: nextGroups,
+      };
+      persistManualGroups(pdfPath, nextManualGroupsByPage);
+      return nextManualGroupsByPage;
+    });
+    setHoveredGroupIndices(new Set());
+    setExportStatus(`Removed saved manual group from page ${currentPageIndex + 1}`);
+  }, [currentPageIndex, pdfPath]);
+
+  const getSeparateExportTargets = useCallback(() => {
+    const exportableSelected = pageObjects
+      .filter(
+        (obj) => selectedObjectIndices.has(obj.index)
+          && !hiddenObjectIndices.has(obj.index)
+          && obj.bounds
+          && obj.object_type !== "text",
+      )
+      .sort((a, b) => a.index - b.index);
+
+    if (exportableSelected.length === 0) return [];
+
+    const selectedSet = new Set(exportableSelected.map((obj) => obj.index));
+    const usedIndices = new Set();
+    const targets = [];
+
+    for (const group of buildObjectGroups(pageObjects, manualGroupsForPage)) {
+      const visibleMemberIndices = group.memberIndices.filter((idx) => !hiddenObjectIndices.has(idx));
+      if (visibleMemberIndices.length < 2) continue;
+
+      const selectedMembers = visibleMemberIndices.filter((idx) => selectedSet.has(idx));
+      if (selectedMembers.length !== visibleMemberIndices.length) continue;
+
+      const members = exportableSelected.filter((obj) => selectedMembers.includes(obj.index));
+      if (members.length === 0) continue;
+
+      let [minL, minB, maxR, maxT] = members[0].bounds;
+      for (const member of members.slice(1)) {
+        const [l, b, r, t] = member.bounds;
+        minL = Math.min(minL, l);
+        minB = Math.min(minB, b);
+        maxR = Math.max(maxR, r);
+        maxT = Math.max(maxT, t);
+      }
+
+      for (const idx of selectedMembers) {
+        usedIndices.add(idx);
+      }
+
+      targets.push({
+        label: group.label,
+        indices: selectedMembers,
+        bounds: [minL, minB, maxR, maxT],
+      });
+    }
+
+    for (const obj of exportableSelected) {
+      if (usedIndices.has(obj.index)) continue;
+      targets.push({
+        label: obj.object_type === "image"
+          ? `Image ${obj.image_width || ""}x${obj.image_height || ""}`.trim()
+          : `${obj.object_type} #${obj.index >= 100000 ? obj.index - 100000 + 1 : obj.index}`,
+        indices: [obj.index],
+        bounds: [...obj.bounds],
+      });
+    }
+
+    return targets;
+  }, [pageObjects, selectedObjectIndices, hiddenObjectIndices, manualGroupsForPage]);
 
   // ── Export selected region as single image (freeze-proof) ──
   const handleExportSelected = useCallback(async () => {
     if (isExporting) return; // guard: prevent double invocation
+    const effectiveSelectedIndices = Array.from(selectedObjectIndices).filter((idx) => !hiddenObjectIndices.has(idx));
+    if (effectiveSelectedIndices.length === 0) return;
     const bounds = getSelectedBounds();
     if (!bounds || !pdfPath) return;
     setIsExporting(true);
-    setExportStatus("");
+    setExportStatus("Preparing selection export...");
     setError("");
     const ext = imagesSaveFormat;
     const ts = Date.now();
     const outputPath = `${pdfPath}-page${currentPageIndex + 1}-selected-${ts}.${ext}`;
     try {
+      await waitForNextPaint();
       await invoke("pdf_export_selected_region", {
         request: {
           page_index: currentPageIndex,
@@ -726,7 +1428,7 @@ export default function PdfEditor({ onBack }) {
           format: ext,
           hide_text: true,
           transparent_bg: transparentBg,
-          selected_object_indices: Array.from(selectedObjectIndices),
+          selected_object_indices: effectiveSelectedIndices,
         },
       });
       setExportStatus(`Saved selected region to ${outputPath}`);
@@ -735,7 +1437,48 @@ export default function PdfEditor({ onBack }) {
     } finally {
       setIsExporting(false);
     }
-  }, [isExporting, getSelectedBounds, pdfPath, currentPageIndex, imagesSaveFormat, transparentBg, selectedObjectIndices]);
+  }, [isExporting, getSelectedBounds, pdfPath, currentPageIndex, imagesSaveFormat, transparentBg, selectedObjectIndices, hiddenObjectIndices, waitForNextPaint]);
+
+  const handleExportSelectedSeparately = useCallback(async () => {
+    if (isExporting || !pdfPath) return;
+    const targets = getSeparateExportTargets();
+    if (targets.length <= 1) return;
+
+    setIsExporting(true);
+    setExportStatus(`Preparing ${targets.length} separate exports...`);
+    setError("");
+
+    try {
+      await waitForNextPaint();
+      const ext = imagesSaveFormat;
+      const ts = Date.now();
+
+      for (let i = 0; i < targets.length; i++) {
+        const target = targets[i];
+        const suffix = String(i + 1).padStart(2, "0");
+        const outputPath = `${pdfPath}-page${currentPageIndex + 1}-selected-${suffix}-${ts}.${ext}`;
+        setExportStatus(`Exporting ${i + 1} of ${targets.length}: ${target.label}`);
+
+        await invoke("pdf_export_selected_region", {
+          request: {
+            page_index: currentPageIndex,
+            bounds: target.bounds,
+            output_path: outputPath,
+            format: ext,
+            hide_text: true,
+            transparent_bg: transparentBg,
+            selected_object_indices: target.indices,
+          },
+        });
+      }
+
+      setExportStatus(`Saved ${targets.length} separate export(s) from page ${currentPageIndex + 1}`);
+    } catch (err) {
+      setError(`Separate export failed: ${err}`);
+    } finally {
+      setIsExporting(false);
+    }
+  }, [isExporting, pdfPath, getSeparateExportTargets, waitForNextPaint, imagesSaveFormat, currentPageIndex, transparentBg]);
 
   // ── Toggle excluded child (for nested layer unselection) ──
   const toggleExcludedChild = useCallback((childIndex) => {
@@ -755,6 +1498,132 @@ export default function PdfEditor({ onBack }) {
     { id: "export", icon: <IconExport />, label: "Export" },
     { id: "info", icon: <IconInfo />, label: "Info" },
   ];
+
+  const filteredLayerObjects = pageObjects.filter((o) => {
+    if (objectFilter === "exportable") {
+      if (!["image", "path", "shading"].includes(o.object_type)) return false;
+    } else if (objectFilter === "path") {
+      if (!SHAPE_OBJECT_TYPES.has(o.object_type)) return false;
+    } else if (objectFilter !== "all" && o.object_type !== objectFilter) return false;
+    if (o.bounds && pages[currentPageIndex]) {
+      const [l, b, r, t] = o.bounds;
+      const objArea = (r - l) * (t - b);
+      const pageArea = pages[currentPageIndex].width * pages[currentPageIndex].height;
+      if (o.object_type === "image" && objArea / pageArea > 0.85) return false;
+      if (o.object_type === "path" && objArea / pageArea > 0.7) return false;
+    }
+    return true;
+  });
+
+  const objectGroups = buildObjectGroups(pageObjects, manualGroupsForPage)
+    .map((group) => ({
+      ...group,
+      members: group.members.filter((member) => filteredLayerObjects.some((obj) => obj.index === member.index)),
+      memberIndices: group.memberIndices.filter((memberIdx) => filteredLayerObjects.some((obj) => obj.index === memberIdx)),
+    }))
+    .filter((group) => group.members.length >= 2);
+
+  const groupedMemberIndices = new Set(objectGroups.flatMap((group) => group.memberIndices));
+  const ungroupedLayerObjects = filteredLayerObjects.filter((obj) => !groupedMemberIndices.has(obj.index));
+  const separateExportTargets = getSeparateExportTargets();
+  const mergeableSelectedIndices = getMergeableSelectedIndices();
+
+  const renderLayerObjectRow = (obj, nested = false, groupMemberIndices = null) => {
+    const isSelected = selectedObjectIndices.has(obj.index);
+    const isHidden = hiddenObjectIndices.has(obj.index);
+    const selectedBg = obj.object_type === "image" ? "bg-emerald-500/10 ring-1 ring-emerald-500/40" :
+      obj.object_type === "text" ? "bg-sky-500/10 ring-1 ring-sky-500/40" :
+      obj.object_type === "path" ? "bg-amber-500/10 ring-1 ring-amber-500/40" :
+      obj.object_type === "shading" ? "bg-purple-500/10 ring-1 ring-purple-500/40" :
+      "bg-slate-700 ring-1 ring-slate-500/40";
+
+    return (
+      <div
+        key={obj.index}
+        ref={(element) => {
+          if (nested) return;
+          if (element) objectRowRefs.current.set(obj.index, element);
+          else objectRowRefs.current.delete(obj.index);
+        }}
+        onMouseEnter={() => {
+          setHoveredGroupIndices(groupMemberIndices ? new Set(groupMemberIndices) : new Set());
+          setHoveredObjectIdx(obj.index);
+        }}
+        onMouseLeave={() => {
+          setHoveredObjectIdx(null);
+          if (groupMemberIndices) {
+            setHoveredGroupIndices(new Set(groupMemberIndices));
+          }
+        }}
+        className={`rounded-lg transition-all duration-150 ${
+          isSelected
+            ? selectedBg
+            : hoveredObjectIdx === obj.index
+            ? "bg-slate-800 ring-1 ring-slate-600"
+            : "bg-slate-800/30 hover:bg-slate-800/60"
+        } ${isHidden ? "opacity-45" : ""}`}
+      >
+        <div
+          className={`flex items-center gap-2.5 cursor-pointer ${nested ? "px-2 py-1.5" : "px-2.5 py-2"}`}
+          onClick={() => toggleObjectSelection(obj.index)}
+        >
+          <span className={`w-4 h-4 rounded-md border-2 flex items-center justify-center shrink-0 transition-colors ${
+            isSelected
+              ? "bg-rose-500 border-rose-500"
+              : "border-slate-600 bg-slate-800 hover:border-slate-400"
+          }`}>
+            {isSelected && (
+              <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+              </svg>
+            )}
+          </span>
+          <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider shrink-0 ${
+            obj.object_type === "image" ? "bg-emerald-500/20 text-emerald-400" :
+            obj.object_type === "text" ? "bg-sky-500/20 text-sky-400" :
+            obj.object_type === "path" ? "bg-amber-500/20 text-amber-400" :
+            obj.object_type === "shading" ? "bg-purple-500/20 text-purple-400" :
+            "bg-slate-700 text-slate-400"
+          }`}>
+            {obj.object_type === "image" ? "IMG" :
+             obj.object_type === "path" ? "SHP" :
+             obj.object_type === "shading" ? "SHD" :
+             obj.object_type === "text" ? "TXT" :
+             obj.object_type.slice(0, 3).toUpperCase()}
+          </span>
+          <span className="text-[11px] text-slate-300 truncate flex-1 font-medium">
+            {obj.object_type === "image"
+              ? `${obj.image_width}×${obj.image_height}px`
+              : obj.object_type === "text" && obj.text_content
+              ? obj.text_content.slice(0, 35) + (obj.text_content.length > 35 ? "…" : "")
+              : `#${obj.index >= 100000 ? obj.index - 100000 + 1 : obj.index}`}
+          </span>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              toggleObjectVisibility(obj.index);
+            }}
+            title={isHidden ? "Show layer" : "Hide layer"}
+            className={`p-1 rounded-md transition-colors shrink-0 ${
+              isHidden
+                ? "text-slate-600 hover:text-slate-300 hover:bg-slate-700"
+                : "text-slate-400 hover:text-slate-100 hover:bg-slate-700"
+            }`}
+          >
+            {isHidden ? <IconEyeOff /> : <IconEye />}
+          </button>
+        </div>
+        {isSelected && obj.object_type === "text" && obj.text_content && (
+          <div className={`${nested ? "px-2 pb-1.5 pt-0" : "px-2.5 pb-2 pt-0.5"}`}>
+            <div className="px-2.5 py-1.5 rounded-md bg-slate-800 text-[10px] text-sky-300/80 select-all cursor-text break-words leading-relaxed border border-sky-500/10">
+              {obj.text_content}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="h-screen flex flex-col bg-slate-950 text-slate-300 font-sans overflow-hidden">
@@ -1061,7 +1930,7 @@ export default function PdfEditor({ onBack }) {
                   {/* Selectable text layer */}
                   {activePanel === "images" && showObjectOverlay && pageObjects.length > 0 && pages[currentPageIndex] && imgRef.current && (
                     <TextLayer
-                      textBlocks={pageObjects.filter(o => o.object_type === "text")}
+                      textBlocks={pageObjects.filter((o) => o.object_type === "text" && !hiddenObjectIndices.has(o.index))}
                       pdfWidth={pages[currentPageIndex].width}
                       pdfHeight={pages[currentPageIndex].height}
                       imgEl={imgRef.current}
@@ -1076,9 +1945,11 @@ export default function PdfEditor({ onBack }) {
                       imgEl={imgRef.current}
                       imgNaturalSize={imgNaturalSize}
                       hoveredIdx={hoveredObjectIdx}
+                      highlightedIndices={hoveredGroupIndices}
                       selectedIndices={selectedObjectIndices}
                       onHover={setHoveredObjectIdx}
-                      onSelect={toggleObjectSelection}
+                      onSelect={handlePageObjectSelection}
+                      hiddenIndices={hiddenObjectIndices}
                       filter={objectFilter}
                       marqueeActive={marqueeActive}
                       marqueeStart={marqueeStart}
@@ -1179,8 +2050,8 @@ export default function PdfEditor({ onBack }) {
             </div>
 
             {/* Panel content */}
-            <div className="w-64 bg-slate-900/70 border-l border-slate-800 overflow-y-auto">
-              <div className="p-4 space-y-4">
+            <div className="w-72 bg-slate-900/80 border-l border-slate-800/80 overflow-y-auto">
+              <div className="p-3 space-y-3">
                 {/* ── Pages Panel ── */}
                 {activePanel === "pages" && (
                   <>
@@ -1365,171 +2236,250 @@ export default function PdfEditor({ onBack }) {
                 {activePanel === "images" && (
                   <>
                     <div className="flex items-center justify-between">
-                      <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                        Objects — Page {currentPageIndex + 1}
+                      <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
+                        <IconLayers />
+                        Layers — Page {currentPageIndex + 1}
                       </h3>
                       <button
                         onClick={() => fetchPageObjects(currentPageIndex)}
-                        className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors"
+                        className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-semibold rounded-md bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 border border-slate-700 hover:border-slate-600 transition-all"
                       >
                         Refresh
                       </button>
                     </div>
 
                     {/* Overlay toggle + filter */}
-                    <div className="space-y-2">
-                      <label className="flex items-center gap-2 cursor-pointer">
+                    <div className="space-y-3">
+                      <label className="flex items-center gap-2.5 cursor-pointer group">
                         <input
                           type="checkbox"
                           checked={showObjectOverlay}
                           onChange={(e) => setShowObjectOverlay(e.target.checked)}
-                          className="rounded border-slate-600 bg-slate-800 text-rose-500 focus:ring-rose-500/30 w-3.5 h-3.5"
+                          className="rounded border-slate-600 bg-slate-800 text-rose-500 focus:ring-rose-500/30 w-4 h-4"
                         />
-                        <span className="text-[11px] text-slate-400">Show bounding boxes on page</span>
+                        <span className="text-[11px] text-slate-400 group-hover:text-slate-200 transition-colors">Show bounding boxes on page</span>
                       </label>
 
-                      <div className="flex gap-1 flex-wrap">
+                      <div className="flex gap-1.5 flex-wrap">
                         {[
-                          { key: "all", label: "All" },
-                          { key: "image", label: "Images", color: "text-emerald-400" },
-                          { key: "text", label: "Text", color: "text-sky-400" },
-                          { key: "path", label: "Shapes", color: "text-amber-400" },
-                          { key: "exportable", label: "Draw", color: "text-rose-400" },
+                          { key: "all", label: "All", active: "bg-slate-700 text-slate-200 ring-1 ring-slate-500" },
+                          { key: "image", label: "Images", active: "bg-emerald-500/20 text-emerald-400 ring-1 ring-emerald-500/40" },
+                          { key: "text", label: "Text", active: "bg-sky-500/20 text-sky-400 ring-1 ring-sky-500/40" },
+                          { key: "path", label: "Shapes", active: "bg-amber-500/20 text-amber-400 ring-1 ring-amber-500/40" },
+                          { key: "exportable", label: "Draw", active: "bg-rose-500/20 text-rose-400 ring-1 ring-rose-500/40" },
                         ].map((f) => (
                           <button
                             key={f.key}
                             onClick={() => setObjectFilter(f.key)}
-                            className={`px-2 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                            className={`px-2.5 py-1 rounded-md text-[10px] font-semibold transition-all ${
                               objectFilter === f.key
-                                ? "bg-slate-700 text-slate-200 ring-1 ring-slate-600"
-                                : "bg-slate-800/60 text-slate-500 hover:text-slate-300"
-                            } ${f.color || ""}`}
+                                ? f.active
+                                : "bg-slate-800/60 text-slate-500 hover:text-slate-300 hover:bg-slate-800"
+                            }`}
                           >
                             {f.label}
                           </button>
                         ))}
                       </div>
 
-                      {/* Object summary */}
+                      <div className="flex gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setLayerViewMode("objects")}
+                          className={`flex-1 px-2.5 py-1 rounded-md text-[10px] font-semibold transition-all ${
+                            layerViewMode === "objects"
+                              ? "bg-slate-700 text-slate-200 ring-1 ring-slate-500"
+                              : "bg-slate-800/60 text-slate-500 hover:text-slate-300 hover:bg-slate-800"
+                          }`}
+                        >
+                          Objects
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setLayerViewMode("groups")}
+                          className={`flex-1 px-2.5 py-1 rounded-md text-[10px] font-semibold transition-all ${
+                            layerViewMode === "groups"
+                              ? "bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40"
+                              : "bg-slate-800/60 text-slate-500 hover:text-slate-300 hover:bg-slate-800"
+                          }`}
+                        >
+                          Groups
+                        </button>
+                      </div>
+
+                      {/* Object summary — pill badges */}
                       {pageObjects.length > 0 && (
-                        <div className="text-[10px] text-slate-500 flex gap-2 flex-wrap">
-                          <span className="text-emerald-400/70">
+                        <div className="flex gap-2 flex-wrap">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/10 text-[10px] font-medium text-emerald-400">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
                             {pageObjects.filter((o) => o.object_type === "image").length} images
                           </span>
-                          <span className="text-sky-400/70">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-sky-500/10 text-[10px] font-medium text-sky-400">
+                            <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
                             {pageObjects.filter((o) => o.object_type === "text").length} text
                           </span>
-                          <span className="text-amber-400/70">
-                            {pageObjects.filter((o) => o.object_type === "path").length} shapes
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/10 text-[10px] font-medium text-amber-400">
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                            {pageObjects.filter((o) => SHAPE_OBJECT_TYPES.has(o.object_type)).length} shapes
                           </span>
                         </div>
                       )}
 
                       {/* Marquee draw hint for exportable mode */}
                       {objectFilter === "exportable" && (
-                        <div className="flex items-center gap-1.5 px-2 py-1.5 rounded-md bg-rose-500/10 border border-rose-500/20">
-                          <svg className="w-3.5 h-3.5 text-rose-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-gradient-to-r from-rose-500/10 to-orange-500/10 border border-rose-500/20">
+                          <svg className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                             <path strokeLinecap="round" strokeLinejoin="round" d="M15.042 21.672L13.684 16.6m0 0l-2.51 2.225.569-9.47 5.227 7.917-3.286-.672zM12 2.25V4.5m5.834.166l-1.591 1.591M20.25 10.5H18M7.757 14.743l-1.59 1.59M6 10.5H3.75m4.007-4.243l-1.59-1.59" />
                           </svg>
-                          <span className="text-[10px] text-rose-300/80">Draw a rectangle on the page to auto-select images, shapes & shadings in that area</span>
+                          <span className="text-[11px] text-rose-300/90 leading-relaxed font-medium">Draw a rectangle on the page to auto-select objects in that area</span>
                         </div>
                       )}
                     </div>
 
                     {/* Object list — click to multi-select */}
                     {pageObjects.length > 0 && (
-                      <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
-                        {pageObjects
-                          .filter((o) => {
-                            if (objectFilter === "exportable") {
-                              if (!["image", "path", "shading"].includes(o.object_type)) return false;
-                            } else if (objectFilter !== "all" && o.object_type !== objectFilter) return false;
-                            // Hide full-page background images/paths from list
-                            if (o.bounds && pages[currentPageIndex]) {
-                              const [l, b, r, t] = o.bounds;
-                              const objArea = (r - l) * (t - b);
-                              const pageArea = pages[currentPageIndex].width * pages[currentPageIndex].height;
-                              if (o.object_type === "image" && objArea / pageArea > 0.85) return false;
-                              if (o.object_type === "path" && objArea / pageArea > 0.7) return false;
-                            }
-                            return true;
-                          })
-                          .map((obj) => {
-                            const isSelected = selectedObjectIndices.has(obj.index);
-                            return (
-                              <div
-                                key={obj.index}
-                                onMouseEnter={() => setHoveredObjectIdx(obj.index)}
-                                onMouseLeave={() => setHoveredObjectIdx(null)}
-                                className={`rounded text-[10px] transition-colors ${
-                                  isSelected
-                                    ? "bg-slate-700 ring-1 ring-rose-500/40"
-                                    : hoveredObjectIdx === obj.index
-                                    ? "bg-slate-800"
-                                    : "bg-slate-800/30 hover:bg-slate-800/60"
-                                }`}
-                              >
+                      <div className="space-y-1.5 max-h-60 overflow-y-auto pr-1">
+                        {layerViewMode === "objects" ? (
+                          filteredLayerObjects.map((obj) => renderLayerObjectRow(obj))
+                        ) : (
+                          <div className="space-y-2">
+                            {objectGroups.map((group) => {
+                              const selectableMembers = group.memberIndices.filter((idx) => !hiddenObjectIndices.has(idx));
+                              const selectedCount = selectableMembers.filter((idx) => selectedObjectIndices.has(idx)).length;
+                              const allSelected = selectableMembers.length > 0 && selectedCount === selectableMembers.length;
+                              const partiallySelected = selectedCount > 0 && selectedCount < selectableMembers.length;
+                              const allHidden = group.memberIndices.every((idx) => hiddenObjectIndices.has(idx));
+                              return (
                                 <div
-                                  className="flex items-center gap-2 px-2 py-1 cursor-pointer"
-                                  onClick={() => toggleObjectSelection(obj.index)}
+                                  key={group.id}
+                                  onMouseEnter={() => {
+                                    setHoveredObjectIdx(null);
+                                    setHoveredGroupIndices(new Set(group.memberIndices));
+                                  }}
+                                  onMouseLeave={() => setHoveredGroupIndices(new Set())}
+                                  className={`rounded-xl border overflow-hidden ${allHidden ? "border-slate-800 bg-slate-900/30 opacity-60" : "border-slate-700/60 bg-slate-900/40 shadow-[0_12px_30px_rgba(15,23,42,0.18)]"}`}
                                 >
-                                  {/* Selection checkbox */}
-                                  <span className={`w-3 h-3 rounded border flex items-center justify-center shrink-0 ${
-                                    isSelected
-                                      ? "bg-rose-500 border-rose-500"
-                                      : "border-slate-600 bg-slate-800"
-                                  }`}>
-                                    {isSelected && (
-                                      <svg className="w-2 h-2 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-                                      </svg>
-                                    )}
-                                  </span>
-                                  <span className={`w-2 h-2 rounded-full shrink-0 ${
-                                    obj.object_type === "image" ? "bg-emerald-400" :
-                                    obj.object_type === "text" ? "bg-sky-400" :
-                                    obj.object_type === "path" ? "bg-amber-400" :
-                                    "bg-slate-500"
-                                  }`} />
-                                  <span className="text-slate-400 truncate flex-1">
-                                    {obj.object_type === "image"
-                                      ? `Image ${obj.image_width}×${obj.image_height}px`
-                                      : obj.object_type === "text" && obj.text_content
-                                      ? obj.text_content.slice(0, 40) + (obj.text_content.length > 40 ? "…" : "")
-                                      : `${obj.object_type} #${obj.index >= 100000 ? obj.index - 100000 + 1 : obj.index}`}
-                                  </span>
-                                </div>
-                                {/* Show text content when selected */}
-                                {isSelected && obj.object_type === "text" && obj.text_content && (
-                                  <div className="px-2 pb-1.5 pt-0.5">
-                                    <div className="px-2 py-1 rounded bg-slate-800 text-[10px] text-sky-300/80 select-all cursor-text break-words leading-relaxed">
-                                      {obj.text_content}
+                                  <div
+                                    className="px-2.5 py-2.5 cursor-pointer"
+                                    onClick={() => toggleGroupSelection(group.memberIndices)}
+                                  >
+                                    <div className="flex items-start justify-between gap-2">
+                                      <div className="flex items-start gap-2 min-w-0 flex-1">
+                                        <span className={`mt-0.5 w-4 h-4 rounded-md border-2 flex items-center justify-center shrink-0 transition-colors ${
+                                          allSelected || partiallySelected
+                                            ? "bg-rose-500 border-rose-500"
+                                            : "border-slate-600 bg-slate-800 hover:border-slate-400"
+                                        }`}>
+                                          {allSelected ? (
+                                            <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                                              <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                                            </svg>
+                                          ) : partiallySelected ? (
+                                            <span className="w-2 h-0.5 rounded-full bg-white" />
+                                          ) : null}
+                                        </span>
+                                        <div className="min-w-0 flex-1 space-y-1">
+                                          <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+                                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider shrink-0 bg-amber-500/20 text-amber-300">
+                                              GRP
+                                            </span>
+                                            {group.isManual && (
+                                              <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider shrink-0 bg-cyan-500/15 text-cyan-300">
+                                                Manual
+                                              </span>
+                                            )}
+                                            <span className="text-[11px] text-slate-200 truncate font-semibold min-w-0">
+                                              {group.label}
+                                            </span>
+                                          </div>
+                                          <div className="text-[10px] text-slate-500">
+                                            {group.memberIndices.length} layer{group.memberIndices.length !== 1 ? "s" : ""}
+                                          </div>
+                                        </div>
+                                      </div>
+                                      <div className="flex items-center gap-1 shrink-0">
+                                        {group.isManual && (
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              handleUngroupManualGroup(group.id);
+                                            }}
+                                            title="Remove manual group"
+                                            className="px-2 py-1 rounded-md text-[9px] font-semibold uppercase tracking-wider text-cyan-300 hover:text-cyan-200 hover:bg-cyan-500/10 border border-cyan-500/15 transition-colors"
+                                          >
+                                            Ungroup
+                                          </button>
+                                        )}
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            toggleGroupVisibility(group.memberIndices);
+                                          }}
+                                          title={allHidden ? "Show group" : "Hide group"}
+                                          className={`p-1.5 rounded-md transition-colors shrink-0 ${
+                                            allHidden
+                                              ? "text-slate-600 hover:text-slate-300 hover:bg-slate-700"
+                                              : "text-slate-400 hover:text-slate-100 hover:bg-slate-700"
+                                          }`}
+                                        >
+                                          {allHidden ? <IconEyeOff /> : <IconEye />}
+                                        </button>
+                                      </div>
                                     </div>
                                   </div>
-                                )}
+                                  <div className="px-2.5 pb-2.5 space-y-1">
+                                    {group.members.map((member) => renderLayerObjectRow(member, true, group.memberIndices))}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                            {ungroupedLayerObjects.length > 0 && (
+                              <div className="space-y-1.5 border-t border-slate-800 pt-2">
+                                <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold px-1">
+                                  Ungrouped Layers
+                                </div>
+                                {ungroupedLayerObjects.map((obj) => renderLayerObjectRow(obj))}
                               </div>
-                            );
-                          })}
+                            )}
+                            {objectGroups.length === 0 && (
+                              <p className="text-[10px] text-slate-600 italic px-1">No groups detected for the current filter.</p>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )}
 
                     {/* Selection info + actions */}
                     {selectedObjectIndices.size > 0 && (
-                      <div className="space-y-2 border-t border-slate-800 pt-3">
+                      <div className="space-y-3 border-t border-slate-700/50 pt-3">
                         <div className="flex items-center justify-between">
-                          <span className="text-[11px] text-slate-400">
+                          <span className="text-[11px] text-slate-300 font-semibold flex items-center gap-1.5">
+                            <span className="w-2 h-2 rounded-full bg-rose-400 animate-pulse" />
                             {selectedObjectIndices.size} object{selectedObjectIndices.size !== 1 ? "s" : ""} selected
                           </span>
                           <button
                             onClick={() => { setSelectedObjectIndices(new Set()); setExcludedChildren(new Set()); }}
-                            className="text-[10px] text-slate-500 hover:text-slate-300 underline transition-colors"
+                            className="text-[10px] text-slate-500 hover:text-rose-400 font-medium transition-colors px-2 py-0.5 rounded hover:bg-rose-500/10"
                           >
-                            Clear
+                            Clear all
                           </button>
                         </div>
 
-                        {/* Nested layer tree for selected group objects */}
-                        {(() => {
+                        <div className="space-y-3 rounded-xl border border-slate-800/90 bg-slate-900/55 px-3 py-3">
+                          {mergeableSelectedIndices.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={handleMergeSelectedIntoGroup}
+                              className="w-full px-3 py-2.5 rounded-xl text-[11px] font-semibold leading-snug bg-cyan-500/10 text-cyan-300 border border-cyan-500/25 hover:bg-cyan-500/15 hover:border-cyan-400/40 transition-all active:scale-[0.97]"
+                            >
+                                Merge {mergeableSelectedIndices.length} Selected Paths Into One Group
+                            </button>
+                          )}
+
+                          {/* Nested layer tree for selected group objects */}
+                          {(() => {
                           const selectedWithChildren = pageObjects.filter(
                             (o) => selectedObjectIndices.has(o.index) && o.children && o.children.length > 0
                           );
@@ -1584,10 +2534,10 @@ export default function PdfEditor({ onBack }) {
                               ))}
                             </div>
                           );
-                        })()}
+                          })()}
 
-                        {/* Save format selector */}
-                        <div>
+                          {/* Save format selector */}
+                          <div>
                           <label className="block text-[10px] text-slate-500 mb-1">Export format</label>
                           <div className="grid grid-cols-3 gap-1">
                             {["png", "jpg", "webp"].map((fmt) => (
@@ -1604,10 +2554,10 @@ export default function PdfEditor({ onBack }) {
                               </button>
                             ))}
                           </div>
-                        </div>
+                          </div>
 
-                        {/* Background mode selector */}
-                        <div>
+                          {/* Background mode selector */}
+                          <div>
                           <label className="block text-[10px] text-slate-500 mb-1">Background</label>
                           <div className="grid grid-cols-2 gap-1">
                             <button
@@ -1636,25 +2586,37 @@ export default function PdfEditor({ onBack }) {
                           {transparentBg && imagesSaveFormat === "jpg" && (
                             <p className="text-[9px] text-amber-400/70 mt-1">JPEG doesn't support transparency — will export with white background</p>
                           )}
-                        </div>
+                          </div>
 
-                        {/* Export selected region */}
-                        {(() => {
+                          {/* Export selected region */}
+                          {(() => {
                           const hasExportable = pageObjects.some(
-                            (o) => selectedObjectIndices.has(o.index) && o.bounds && o.object_type !== "text"
+                            (o) => selectedObjectIndices.has(o.index) && !hiddenObjectIndices.has(o.index) && o.bounds && o.object_type !== "text"
                           );
                           return hasExportable ? (
-                            <button
-                              onClick={handleExportSelected}
-                              disabled={isExporting}
-                              className="w-full py-2 rounded-lg text-xs font-semibold bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white transition-all active:scale-[0.97] shadow-lg shadow-rose-500/15 disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                              {isExporting ? "Exporting..." : `Export Selected as ${imagesSaveFormat.toUpperCase()}`}
-                            </button>
+                            <div className="space-y-2">
+                              <button
+                                onClick={handleExportSelected}
+                                disabled={isExporting}
+                                className="w-full py-2 rounded-lg text-xs font-semibold bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white transition-all active:scale-[0.97] shadow-lg shadow-rose-500/15 disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                {isExporting ? "Exporting..." : `Export Combined as ${imagesSaveFormat.toUpperCase()}`}
+                              </button>
+                              {separateExportTargets.length > 1 && (
+                                <button
+                                  onClick={handleExportSelectedSeparately}
+                                  disabled={isExporting}
+                                  className="w-full py-2 rounded-lg text-xs font-semibold bg-slate-800 text-slate-200 border border-slate-700 hover:bg-slate-700 hover:border-slate-600 transition-all active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                  {isExporting ? "Exporting..." : `Export ${separateExportTargets.length} Items Separately`}
+                                </button>
+                              )}
+                            </div>
                           ) : (
                             <p className="text-[10px] text-slate-600 italic">Select images or shapes to export</p>
                           );
-                        })()}
+                          })()}
+                        </div>
                       </div>
                     )}
 
@@ -1914,9 +2876,11 @@ function ObjectOverlay({
   imgEl,
   imgNaturalSize,
   hoveredIdx,
+  highlightedIndices,
   selectedIndices,
   onHover,
   onSelect,
+  hiddenIndices,
   filter,
   marqueeActive,
   marqueeStart,
@@ -1936,8 +2900,11 @@ function ObjectOverlay({
   // Apply user filter — include text objects now
   const filtered = pageObjects.filter((obj) => {
     if (!obj.bounds) return false;
+    if (hiddenIndices && hiddenIndices.has(obj.index)) return false;
     if (filter === "exportable") {
       if (!["image", "path", "shading"].includes(obj.object_type)) return false;
+    } else if (filter === "path") {
+      if (!SHAPE_OBJECT_TYPES.has(obj.object_type)) return false;
     } else if (filter !== "all" && obj.object_type !== filter) return false;
     const [l, b, r, t] = obj.bounds;
     const areaRatio = ((r - l) * (t - b)) / pageArea;
@@ -1997,6 +2964,21 @@ function ObjectOverlay({
     }
   };
 
+  const highlightedGroupObjects = highlightedIndices
+    ? filtered.filter((obj) => highlightedIndices.has(obj.index))
+    : [];
+  const groupHighlightBounds = highlightedGroupObjects.length > 1
+    ? highlightedGroupObjects.reduce((acc, obj) => {
+        const [left, bottom, right, top] = obj.bounds;
+        return [
+          Math.min(acc[0], left),
+          Math.min(acc[1], bottom),
+          Math.max(acc[2], right),
+          Math.max(acc[3], top),
+        ];
+      }, [Infinity, Infinity, -Infinity, -Infinity])
+    : null;
+
   return (
     <div
       className="absolute inset-0"
@@ -2012,7 +2994,7 @@ function ObjectOverlay({
         if (w < 2 || h < 2) return null;
 
         const colors = OBJECT_COLORS[obj.object_type] || OBJECT_COLORS.path;
-        const isHovered = hoveredIdx === obj.index;
+        const isHovered = hoveredIdx === obj.index || (highlightedIndices && highlightedIndices.has(obj.index));
         const isSelected = selectedIndices.has(obj.index);
         const isHighlighted = isHovered || isSelected;
         const isImage = obj.object_type === "image";
@@ -2066,6 +3048,45 @@ function ObjectOverlay({
           </div>
         );
       })}
+
+      {groupHighlightBounds && (() => {
+        const [left, bottom, right, top] = groupHighlightBounds;
+        const x = left * scaleX;
+        const y = (pdfHeight - top) * scaleY;
+        const w = (right - left) * scaleX;
+        const h = (top - bottom) * scaleY;
+        if (w < 2 || h < 2) return null;
+        return (
+          <>
+            <div
+              className="absolute pointer-events-none"
+              style={{
+                left: `${x}px`,
+                top: `${y}px`,
+                width: `${w}px`,
+                height: `${h}px`,
+                border: "2px dashed rgba(34, 211, 238, 0.98)",
+                backgroundColor: "rgba(34, 211, 238, 0.06)",
+                boxShadow: "0 0 0 2px rgba(34, 211, 238, 0.18), 0 0 22px rgba(34, 211, 238, 0.18)",
+                borderRadius: "6px",
+                zIndex: 12,
+              }}
+            />
+            <div
+              className="absolute pointer-events-none px-2 py-0.5 rounded text-[10px] font-semibold whitespace-nowrap shadow-lg"
+              style={{
+                left: `${x}px`,
+                top: `${Math.max(0, y - 24)}px`,
+                backgroundColor: "rgba(34, 211, 238, 0.96)",
+                color: "#111827",
+                zIndex: 13,
+              }}
+            >
+              Group
+            </div>
+          </>
+        );
+      })()}
 
       {/* Marquee rectangle visualization */}
       {marqueeActive && marqueeStart && marqueeEnd && (() => {
