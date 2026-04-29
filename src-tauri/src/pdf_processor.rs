@@ -4,7 +4,7 @@
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use image::DynamicImage;
-use lopdf::{dictionary, Document as LopdfDocument};
+use lopdf::{dictionary, Document as LopdfDocument, ObjectId};
 use pdfium_render::prelude::*;
 use std::collections::HashSet;
 use std::env;
@@ -62,6 +62,19 @@ pub struct PageInfo {
     pub height: f64,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PageOrganizationItem {
+    pub kind: String,
+    #[serde(default)]
+    pub original_index: Option<usize>,
+    #[serde(default)]
+    pub image_path: Option<String>,
+    #[serde(default)]
+    pub width: Option<f64>,
+    #[serde(default)]
+    pub height: Option<f64>,
+}
+
 /// Info about a single page object (image, text, path, etc.)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PageObjectInfo {
@@ -95,6 +108,63 @@ pub enum ImageFormat {
     WebP,
 }
 
+fn bounds_overlap(bounds_a: [f64; 4], bounds_b: [f64; 4], padding: f64) -> bool {
+    !(bounds_a[2] + padding < bounds_b[0]
+        || bounds_b[2] + padding < bounds_a[0]
+        || bounds_a[3] + padding < bounds_b[1]
+        || bounds_b[3] + padding < bounds_a[1])
+}
+
+fn hide_text_in_form_object(
+    object: &mut PdfPageObject<'_>,
+    selected_text_bounds: &[[f64; 4]],
+    hide_all_text: bool,
+) {
+    if object.object_type() == PdfPageObjectType::Text {
+        let should_hide = if hide_all_text || selected_text_bounds.is_empty() {
+            true
+        } else if let Ok(b) = object.bounds() {
+            let obj_bounds = [
+                b.left().value as f64,
+                b.bottom().value as f64,
+                b.right().value as f64,
+                b.top().value as f64,
+            ];
+
+            !selected_text_bounds.iter().any(|selected_bounds| {
+                bounds_overlap(*selected_bounds, obj_bounds, 1.5)
+            })
+        } else {
+            true
+        };
+
+        if should_hide {
+            let _ = object.translate(PdfPoints::new(-100000.0), PdfPoints::new(-100000.0));
+        }
+
+        return;
+    }
+
+    if let Some(form_object) = object.as_x_object_form_object_mut() {
+        for child_index in 0..form_object.len() {
+            if let Ok(mut child) = form_object.get(child_index) {
+                hide_text_in_form_object(&mut child, selected_text_bounds, hide_all_text);
+            }
+        }
+    }
+}
+
+fn resize_image_if_needed(image: DynamicImage, width: Option<u32>, height: Option<u32>) -> DynamicImage {
+    let target_width = width.unwrap_or_else(|| image.width()).max(1);
+    let target_height = height.unwrap_or_else(|| image.height()).max(1);
+
+    if target_width == image.width() && target_height == image.height() {
+        return image;
+    }
+
+    image.resize_exact(target_width, target_height, image::imageops::FilterType::Lanczos3)
+}
+
 // ── PdfDocument ──
 
 pub struct PdfDocument {
@@ -102,6 +172,169 @@ pub struct PdfDocument {
 }
 
 impl PdfDocument {
+    fn save_lopdf_document(&self, mut doc: LopdfDocument, operation_label: &str) -> Result<PathBuf> {
+        let temp_path = self.path.with_extension("pdf.tmp");
+        doc.save(&temp_path)
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&temp_path);
+                anyhow!("Failed to save PDF after {}: {}", operation_label, e)
+            })?;
+
+        std::fs::rename(&temp_path, &self.path)
+            .map_err(|e| anyhow!("Failed to replace original PDF: {}", e))?;
+
+        Ok(self.path.clone())
+    }
+
+    fn save_verified_lopdf_document(
+        &self,
+        mut doc: LopdfDocument,
+        operation_label: &str,
+    ) -> Result<PathBuf> {
+        let temp_path = self.path.with_extension("pdf.tmp");
+        doc.save(&temp_path)
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&temp_path);
+                anyhow!("Failed to save PDF after {}: {}", operation_label, e)
+            })?;
+
+        match get_pdfium() {
+            Ok(pdfium) => {
+                if let Err(e) = pdfium.load_pdf_from_file(&temp_path, None) {
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(anyhow!(
+                        "{} produced a corrupt PDF (original preserved): {}",
+                        operation_label,
+                        e
+                    ));
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(anyhow!("Cannot verify PDF (PDFium unavailable): {}", e));
+            }
+        }
+
+        std::fs::rename(&temp_path, &self.path)
+            .map_err(|e| anyhow!("Failed to replace original PDF: {}", e))?;
+
+        Ok(self.path.clone())
+    }
+
+    fn create_blank_page_in_document(
+        &self,
+        doc: &mut LopdfDocument,
+        pages_id: ObjectId,
+        width: f32,
+        height: f32,
+    ) -> Result<(ObjectId, f64, f64)> {
+        let blank_page_dict = dictionary! {
+            "Type" => "Page",
+            "MediaBox" => vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(0),
+                lopdf::Object::Real(width),
+                lopdf::Object::Real(height),
+            ],
+            "Contents" => lopdf::Object::Stream(lopdf::Stream::new(
+                dictionary! {},
+                Vec::new(),
+            )),
+        };
+
+        let new_page_id = doc.add_object(blank_page_dict);
+
+        if let Ok(page_obj) = doc.get_object_mut(new_page_id).and_then(|o| o.as_dict_mut()) {
+            page_obj.set("Parent", lopdf::Object::Reference(pages_id));
+        }
+
+        Ok((new_page_id, width as f64, height as f64))
+    }
+
+    fn create_image_page_in_document(
+        &self,
+        doc: &mut LopdfDocument,
+        pages_id: ObjectId,
+        image_path: impl AsRef<Path>,
+    ) -> Result<(ObjectId, f64, f64)> {
+        let image_path = image_path.as_ref();
+        if !image_path.exists() {
+            return Err(anyhow!("Image file does not exist: {:?}", image_path));
+        }
+
+        let img = image::open(image_path)
+            .map_err(|e| anyhow!("Failed to open image {:?}: {}", image_path, e))?;
+        let img_w = img.width() as f64;
+        let img_h = img.height() as f64;
+
+        let max_dim = 2000.0;
+        let scale = if img_w > max_dim || img_h > max_dim {
+            (max_dim / img_w).min(max_dim / img_h)
+        } else if img_w < 72.0 && img_h < 72.0 {
+            200.0 / img_w.max(img_h)
+        } else {
+            1.0
+        };
+        let page_w = (img_w * scale) as f32;
+        let page_h = (img_h * scale) as f32;
+
+        let rgb_img = img.to_rgb8();
+        let mut jpeg_buf = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut jpeg_buf);
+            rgb_img
+                .write_to(&mut cursor, image::ImageFormat::Jpeg)
+                .map_err(|e| anyhow!("Failed to encode image as JPEG: {}", e))?;
+        }
+
+        let img_stream = lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => lopdf::Object::Integer(img_w as i64),
+                "Height" => lopdf::Object::Integer(img_h as i64),
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => lopdf::Object::Integer(8),
+                "Filter" => "DCTDecode",
+                "Length" => lopdf::Object::Integer(jpeg_buf.len() as i64),
+            },
+            jpeg_buf,
+        );
+        let img_obj_id = doc.add_object(lopdf::Object::Stream(img_stream));
+
+        let resources_dict = dictionary! {
+            "XObject" => dictionary! {
+                "Img0" => lopdf::Object::Reference(img_obj_id),
+            },
+        };
+
+        let content = format!(
+            "q\n{:.2} 0 0 {:.2} 0 0 cm\n/Img0 Do\nQ\n",
+            page_w, page_h
+        );
+        let content_stream = lopdf::Stream::new(dictionary! {}, content.into_bytes());
+        let content_id = doc.add_object(lopdf::Object::Stream(content_stream));
+
+        let page_dict = dictionary! {
+            "Type" => "Page",
+            "MediaBox" => vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Integer(0),
+                lopdf::Object::Real(page_w),
+                lopdf::Object::Real(page_h),
+            ],
+            "Contents" => lopdf::Object::Reference(content_id),
+            "Resources" => resources_dict,
+        };
+        let new_page_id = doc.add_object(page_dict);
+
+        if let Ok(page_obj) = doc.get_object_mut(new_page_id).and_then(|o| o.as_dict_mut()) {
+            page_obj.set("Parent", lopdf::Object::Reference(pages_id));
+        }
+
+        Ok((new_page_id, page_w as f64, page_h as f64))
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
@@ -417,6 +650,90 @@ impl PdfDocument {
 
     // ── Page manipulation via lopdf ──
 
+    pub fn apply_page_organization(&self, items: &[PageOrganizationItem]) -> Result<Vec<PageInfo>> {
+        if items.is_empty() {
+            return Err(anyhow!("Page organization cannot be empty"));
+        }
+
+        let mut doc = LopdfDocument::load(&self.path)
+            .map_err(|e| anyhow!("Failed to parse PDF: {}", e))?;
+
+        let pages_id = doc.catalog()
+            .map_err(|e| anyhow!("No catalog: {}", e))?
+            .get(b"Pages")
+            .map_err(|e| anyhow!("No Pages ref: {}", e))?
+            .as_reference()
+            .map_err(|e| anyhow!("Pages not a ref: {}", e))?;
+
+        let mut page_ids: Vec<(u32, lopdf::ObjectId)> = doc.get_pages().into_iter().collect();
+        page_ids.sort_by_key(|(num, _)| *num);
+        let ordered_ids: Vec<lopdf::ObjectId> = page_ids.into_iter().map(|(_, id)| id).collect();
+
+        let (default_width, default_height) = self.first_page_size().unwrap_or((595.0, 842.0));
+        let mut new_kids = Vec::with_capacity(items.len());
+        let mut refreshed_pages = Vec::with_capacity(items.len());
+
+        for (page_index, item) in items.iter().enumerate() {
+            match item.kind.as_str() {
+                "existing" => {
+                    let original_index = item
+                        .original_index
+                        .ok_or_else(|| anyhow!("Existing page item is missing original_index"))?;
+                    let page_id = ordered_ids.get(original_index).ok_or_else(|| {
+                        anyhow!("Existing page index {} is out of bounds", original_index)
+                    })?;
+                    new_kids.push(lopdf::Object::Reference(*page_id));
+                    refreshed_pages.push(PageInfo {
+                        index: page_index,
+                        width: item.width.unwrap_or(default_width),
+                        height: item.height.unwrap_or(default_height),
+                    });
+                }
+                "blank" => {
+                    let blank_width = item.width.unwrap_or(default_width) as f32;
+                    let blank_height = item.height.unwrap_or(default_height) as f32;
+                    let (page_id, page_width, page_height) = self.create_blank_page_in_document(
+                        &mut doc,
+                        pages_id,
+                        blank_width,
+                        blank_height,
+                    )?;
+                    new_kids.push(lopdf::Object::Reference(page_id));
+                    refreshed_pages.push(PageInfo {
+                        index: page_index,
+                        width: page_width,
+                        height: page_height,
+                    });
+                }
+                "image" => {
+                    let image_path = item
+                        .image_path
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Image page item is missing image_path"))?;
+                    let (page_id, page_width, page_height) =
+                        self.create_image_page_in_document(&mut doc, pages_id, image_path)?;
+                    new_kids.push(lopdf::Object::Reference(page_id));
+                    refreshed_pages.push(PageInfo {
+                        index: page_index,
+                        width: page_width,
+                        height: page_height,
+                    });
+                }
+                other => {
+                    return Err(anyhow!("Unsupported page organization item kind: {}", other));
+                }
+            }
+        }
+
+        if let Ok(pages_dict) = doc.get_object_mut(pages_id).and_then(|o| o.as_dict_mut()) {
+            pages_dict.set("Kids", lopdf::Object::Array(new_kids));
+            pages_dict.set("Count", lopdf::Object::Integer(items.len() as i64));
+        }
+
+        self.save_lopdf_document(doc, "apply page organization")?;
+        Ok(refreshed_pages)
+    }
+
     /// Delete pages by indices (0-based). Saves safely via temp file to prevent corruption.
     pub fn delete_pages(&self, page_indices: &[usize]) -> Result<PathBuf> {
         let mut doc = LopdfDocument::load(&self.path)
@@ -432,32 +749,7 @@ impl PdfDocument {
             doc.delete_pages(&[page_num]);
         }
 
-        // Save to temp file first, then rename — prevents corruption if save fails
-        let temp_path = self.path.with_extension("pdf.tmp");
-        doc.save(&temp_path)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&temp_path);
-                anyhow!("Failed to save PDF after deleting pages: {}", e)
-            })?;
-
-        // Verify the temp file is a valid PDF before replacing the original
-        match get_pdfium() {
-            Ok(pdfium) => {
-                if let Err(e) = pdfium.load_pdf_from_file(&temp_path, None) {
-                    let _ = std::fs::remove_file(&temp_path);
-                    return Err(anyhow!("Delete produced a corrupt PDF (original preserved): {}", e));
-                }
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(anyhow!("Cannot verify PDF (PDFium unavailable): {}", e));
-            }
-        }
-
-        std::fs::rename(&temp_path, &self.path)
-            .map_err(|e| anyhow!("Failed to replace original PDF: {}", e))?;
-
-        Ok(self.path.clone())
+        self.save_verified_lopdf_document(doc, "deleting pages")
     }
 
     /// Reorder pages. `new_order` is 0-based indices in desired order.
@@ -494,31 +786,7 @@ impl PdfDocument {
             pages_dict.set("Count", lopdf::Object::Integer(new_order.len() as i64));
         }
 
-        // Save to temp file, verify, then rename
-        let temp_path = self.path.with_extension("pdf.tmp");
-        doc.save(&temp_path)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&temp_path);
-                anyhow!("Failed to save PDF after reorder: {}", e)
-            })?;
-
-        match get_pdfium() {
-            Ok(pdfium) => {
-                if let Err(e) = pdfium.load_pdf_from_file(&temp_path, None) {
-                    let _ = std::fs::remove_file(&temp_path);
-                    return Err(anyhow!("Reorder produced a corrupt PDF (original preserved): {}", e));
-                }
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(anyhow!("Cannot verify PDF (PDFium unavailable): {}", e));
-            }
-        }
-
-        std::fs::rename(&temp_path, &self.path)
-            .map_err(|e| anyhow!("Failed to replace original PDF: {}", e))?;
-
-        Ok(self.path.clone())
+        self.save_verified_lopdf_document(doc, "reordering pages")
     }
 
     /// Insert a blank page at `position` (0-based).
@@ -530,28 +798,14 @@ impl PdfDocument {
         let w = w as f32;
         let h = h as f32;
 
-        let blank_page_dict = dictionary! {
-            "Type" => "Page",
-            "MediaBox" => vec![
-                lopdf::Object::Integer(0),
-                lopdf::Object::Integer(0),
-                lopdf::Object::Real(w),
-                lopdf::Object::Real(h),
-            ],
-            "Contents" => lopdf::Object::Stream(lopdf::Stream::new(
-                dictionary! {},
-                Vec::new(),
-            )),
-        };
-
-        let new_page_id = doc.add_object(blank_page_dict);
-
         let pages_id = doc.catalog()
             .map_err(|e| anyhow!("No catalog: {}", e))?
             .get(b"Pages")
             .map_err(|e| anyhow!("No Pages ref: {}", e))?
             .as_reference()
             .map_err(|e| anyhow!("Pages not a ref: {}", e))?;
+
+        let (new_page_id, _, _) = self.create_blank_page_in_document(&mut doc, pages_id, w, h)?;
 
         if let Ok(pages_dict) = doc.get_object_mut(pages_id).and_then(|o| o.as_dict_mut()) {
             let count = pages_dict
@@ -572,130 +826,24 @@ impl PdfDocument {
             pages_dict.set("Count", lopdf::Object::Integer(count + 1));
         }
 
-        // Set Parent reference
-        if let Ok(page_obj) = doc.get_object_mut(new_page_id).and_then(|o| o.as_dict_mut()) {
-            page_obj.set("Parent", lopdf::Object::Reference(pages_id));
-        }
-
-        // Save to temp file, verify, then rename
-        let temp_path = self.path.with_extension("pdf.tmp");
-        doc.save(&temp_path)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&temp_path);
-                anyhow!("Failed to save PDF after insert: {}", e)
-            })?;
-
-        match get_pdfium() {
-            Ok(pdfium) => {
-                if let Err(e) = pdfium.load_pdf_from_file(&temp_path, None) {
-                    let _ = std::fs::remove_file(&temp_path);
-                    return Err(anyhow!("Insert produced a corrupt PDF (original preserved): {}", e));
-                }
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(anyhow!("Cannot verify PDF (PDFium unavailable): {}", e));
-            }
-        }
-
-        std::fs::rename(&temp_path, &self.path)
-            .map_err(|e| anyhow!("Failed to replace original PDF: {}", e))?;
-
-        Ok(self.path.clone())
+        self.save_verified_lopdf_document(doc, "inserting a blank page")
     }
 
     /// Insert an image file as a new PDF page at `position`.
     /// The image is embedded as a JPEG XObject and the page is sized to the image dimensions
     /// (scaled to fit within reasonable PDF page bounds).
     pub fn insert_image_as_page(&self, image_path: impl AsRef<Path>, position: usize) -> Result<PathBuf> {
-        let image_path = image_path.as_ref();
-        if !image_path.exists() {
-            return Err(anyhow!("Image file does not exist: {:?}", image_path));
-        }
-
-        // Load the image
-        let img = image::open(image_path)
-            .map_err(|e| anyhow!("Failed to open image {:?}: {}", image_path, e))?;
-        let img_w = img.width() as f64;
-        let img_h = img.height() as f64;
-
-        // Scale image dimensions to fit within typical PDF page bounds (max 2000pt on either side)
-        let max_dim = 2000.0;
-        let scale = if img_w > max_dim || img_h > max_dim {
-            (max_dim / img_w).min(max_dim / img_h)
-        } else if img_w < 72.0 && img_h < 72.0 {
-            // Very small images: scale up to at least 200pt
-            200.0 / img_w.max(img_h)
-        } else {
-            1.0
-        };
-        let page_w = (img_w * scale) as f32;
-        let page_h = (img_h * scale) as f32;
-
-        // Encode image as JPEG bytes
-        let rgb_img = img.to_rgb8();
-        let mut jpeg_buf = Vec::new();
-        {
-            let mut cursor = std::io::Cursor::new(&mut jpeg_buf);
-            rgb_img.write_to(&mut cursor, image::ImageFormat::Jpeg)
-                .map_err(|e| anyhow!("Failed to encode image as JPEG: {}", e))?;
-        }
-
         let mut doc = LopdfDocument::load(&self.path)
             .map_err(|e| anyhow!("Failed to parse PDF: {}", e))?;
 
-        // Create image XObject stream
-        let img_stream = lopdf::Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Image",
-                "Width" => lopdf::Object::Integer(img_w as i64),
-                "Height" => lopdf::Object::Integer(img_h as i64),
-                "ColorSpace" => "DeviceRGB",
-                "BitsPerComponent" => lopdf::Object::Integer(8),
-                "Filter" => "DCTDecode",
-                "Length" => lopdf::Object::Integer(jpeg_buf.len() as i64),
-            },
-            jpeg_buf,
-        );
-        let img_obj_id = doc.add_object(lopdf::Object::Stream(img_stream));
-
-        // Create Resources dictionary referencing the image
-        let resources_dict = dictionary! {
-            "XObject" => dictionary! {
-                "Img0" => lopdf::Object::Reference(img_obj_id),
-            },
-        };
-
-        // Content stream: draw the image scaled to fill the page
-        let content = format!(
-            "q\n{:.2} 0 0 {:.2} 0 0 cm\n/Img0 Do\nQ\n",
-            page_w, page_h
-        );
-        let content_stream = lopdf::Stream::new(dictionary! {}, content.into_bytes());
-        let content_id = doc.add_object(lopdf::Object::Stream(content_stream));
-
-        // Create the page dictionary
-        let page_dict = dictionary! {
-            "Type" => "Page",
-            "MediaBox" => vec![
-                lopdf::Object::Integer(0),
-                lopdf::Object::Integer(0),
-                lopdf::Object::Real(page_w),
-                lopdf::Object::Real(page_h),
-            ],
-            "Contents" => lopdf::Object::Reference(content_id),
-            "Resources" => resources_dict,
-        };
-        let new_page_id = doc.add_object(page_dict);
-
-        // Insert the page into the page tree
         let pages_id = doc.catalog()
             .map_err(|e| anyhow!("No catalog: {}", e))?
             .get(b"Pages")
             .map_err(|e| anyhow!("No Pages ref: {}", e))?
             .as_reference()
             .map_err(|e| anyhow!("Pages not a ref: {}", e))?;
+
+        let (new_page_id, _, _) = self.create_image_page_in_document(&mut doc, pages_id, image_path)?;
 
         if let Ok(pages_dict) = doc.get_object_mut(pages_id).and_then(|o| o.as_dict_mut()) {
             let count = pages_dict
@@ -716,36 +864,7 @@ impl PdfDocument {
             pages_dict.set("Count", lopdf::Object::Integer(count + 1));
         }
 
-        // Set Parent reference
-        if let Ok(page_obj) = doc.get_object_mut(new_page_id).and_then(|o| o.as_dict_mut()) {
-            page_obj.set("Parent", lopdf::Object::Reference(pages_id));
-        }
-
-        // Save to temp file, verify, then rename
-        let temp_path = self.path.with_extension("pdf.tmp");
-        doc.save(&temp_path)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&temp_path);
-                anyhow!("Failed to save PDF after image insert: {}", e)
-            })?;
-
-        match get_pdfium() {
-            Ok(pdfium) => {
-                if let Err(e) = pdfium.load_pdf_from_file(&temp_path, None) {
-                    let _ = std::fs::remove_file(&temp_path);
-                    return Err(anyhow!("Image insert produced a corrupt PDF (original preserved): {}", e));
-                }
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(anyhow!("Cannot verify PDF (PDFium unavailable): {}", e));
-            }
-        }
-
-        std::fs::rename(&temp_path, &self.path)
-            .map_err(|e| anyhow!("Failed to replace original PDF: {}", e))?;
-
-        Ok(self.path.clone())
+        self.save_verified_lopdf_document(doc, "inserting an image page")
     }
 
     fn first_page_size(&self) -> Option<(f64, f64)> {
@@ -1089,16 +1208,20 @@ impl PdfDocument {
     /// `bounds` is [left, bottom, right, top] in PDF points.
     /// If `hide_text` is true, text objects are hidden before rendering.
     /// If `transparent_bg` is true, the background is transparent; otherwise white.
-    pub fn export_selected_region(
+    pub fn render_selected_region_image(
         &self,
         page_index: usize,
         bounds: [f64; 4],
-        output_path: impl AsRef<Path>,
-        format: ImageFormat,
         hide_text: bool,
         transparent_bg: bool,
         selected_object_indices: &[usize],
-    ) -> Result<()> {
+        selected_form_object_indices: &[usize],
+        hidden_object_indices: &[usize],
+        selected_text_bounds: &[[f64; 4]],
+        hide_unselected_text: bool,
+        resize_width: Option<u32>,
+        resize_height: Option<u32>,
+    ) -> Result<DynamicImage> {
         let pdfium = get_pdfium()?;
         let document = pdfium
             .load_pdf_from_file(&self.path, None)
@@ -1107,13 +1230,78 @@ impl PdfDocument {
         let page = document.pages().get(page_index as u16)
             .map_err(|e| anyhow!("Failed to get page {}: {}", page_index, e))?;
 
-        // If explicit selection is provided, always hide ALL non-selected objects
-        // so export contains only what the user selected (for both Transparent and As-is).
-        // If no explicit selection is provided, keep legacy hide_text behavior.
-        if !selected_object_indices.is_empty() {
-            let keep: HashSet<usize> = selected_object_indices.iter().copied().collect();
+        let selected_keep = if selected_object_indices.is_empty() {
+            None
+        } else {
+            Some(selected_object_indices.iter().copied().collect::<HashSet<usize>>())
+        };
+
+        if let Some(keep) = &selected_keep {
             for (idx, mut obj) in page.objects().iter().enumerate() {
+                if hide_unselected_text && obj.object_type() == PdfPageObjectType::Text {
+                    continue;
+                }
                 if !keep.contains(&idx) {
+                    let _ = obj.translate(PdfPoints::new(-100000.0), PdfPoints::new(-100000.0));
+                }
+            }
+
+            if hide_unselected_text || hide_text {
+                let selected_forms: HashSet<usize> = selected_form_object_indices.iter().copied().collect();
+                for (idx, mut obj) in page.objects().iter().enumerate() {
+                    if !keep.contains(&idx) || !selected_forms.contains(&idx) || obj.object_type() != PdfPageObjectType::XObjectForm {
+                        continue;
+                    }
+
+                    hide_text_in_form_object(&mut obj, selected_text_bounds, hide_text);
+                }
+            }
+        }
+
+        if selected_object_indices.is_empty() && !selected_form_object_indices.is_empty() && (hide_unselected_text || hide_text) {
+            let selected_forms: HashSet<usize> = selected_form_object_indices.iter().copied().collect();
+            for (idx, mut obj) in page.objects().iter().enumerate() {
+                if !selected_forms.contains(&idx) || obj.object_type() != PdfPageObjectType::XObjectForm {
+                    continue;
+                }
+
+                hide_text_in_form_object(&mut obj, selected_text_bounds, hide_text);
+            }
+        }
+
+        if !hidden_object_indices.is_empty() {
+            let hidden: HashSet<usize> = hidden_object_indices.iter().copied().collect();
+            for (idx, mut obj) in page.objects().iter().enumerate() {
+                if hidden.contains(&idx) {
+                    let _ = obj.translate(PdfPoints::new(-100000.0), PdfPoints::new(-100000.0));
+                }
+            }
+        }
+
+        if hide_unselected_text {
+            for mut obj in page.objects().iter() {
+                if obj.object_type() != PdfPageObjectType::Text {
+                    continue;
+                }
+
+                let should_hide = if selected_text_bounds.is_empty() {
+                    true
+                } else if let Ok(b) = obj.bounds() {
+                    let obj_bounds = [
+                        b.left().value as f64,
+                        b.bottom().value as f64,
+                        b.right().value as f64,
+                        b.top().value as f64,
+                    ];
+
+                    !selected_text_bounds.iter().any(|selected_bounds| {
+                        bounds_overlap(*selected_bounds, obj_bounds, 1.5)
+                    })
+                } else {
+                    true
+                };
+
+                if should_hide {
                     let _ = obj.translate(PdfPoints::new(-100000.0), PdfPoints::new(-100000.0));
                 }
             }
@@ -1128,7 +1316,6 @@ impl PdfDocument {
         let page_width = page.width().value as f64;
         let page_height = page.height().value as f64;
 
-        // Render at 3x resolution
         let render_width = (page_width * 3.0) as i32;
         let mut render_config = PdfRenderConfig::new()
             .set_target_width(render_width);
@@ -1144,20 +1331,53 @@ impl PdfDocument {
         let scale_x = img_w / page_width;
         let scale_y = img_h / page_height;
 
-        // Convert PDF coordinates (bottom-left origin) to pixel coordinates (top-left origin)
         let [left, bottom, right, top] = bounds;
         let px_left = ((left * scale_x).max(0.0)) as u32;
         let px_top = (((page_height - top) * scale_y).max(0.0)) as u32;
         let px_w = (((right - left) * scale_x).max(1.0)) as u32;
         let px_h = (((top - bottom) * scale_y).max(1.0)) as u32;
 
-        // Clamp to image bounds
         let px_left = px_left.min(image.width().saturating_sub(1));
         let px_top = px_top.min(image.height().saturating_sub(1));
         let px_w = px_w.min(image.width().saturating_sub(px_left));
         let px_h = px_h.min(image.height().saturating_sub(px_top));
 
-        let cropped = image.crop_imm(px_left, px_top, px_w, px_h);
+        Ok(resize_image_if_needed(
+            image.crop_imm(px_left, px_top, px_w, px_h),
+            resize_width,
+            resize_height,
+        ))
+    }
+
+    pub fn export_selected_region(
+        &self,
+        page_index: usize,
+        bounds: [f64; 4],
+        output_path: impl AsRef<Path>,
+        format: ImageFormat,
+        hide_text: bool,
+        transparent_bg: bool,
+        selected_object_indices: &[usize],
+        selected_form_object_indices: &[usize],
+        hidden_object_indices: &[usize],
+        selected_text_bounds: &[[f64; 4]],
+        hide_unselected_text: bool,
+        resize_width: Option<u32>,
+        resize_height: Option<u32>,
+    ) -> Result<()> {
+        let cropped = self.render_selected_region_image(
+            page_index,
+            bounds,
+            hide_text,
+            transparent_bg,
+            selected_object_indices,
+            selected_form_object_indices,
+            hidden_object_indices,
+            selected_text_bounds,
+            hide_unselected_text,
+            resize_width,
+            resize_height,
+        )?;
 
         match format {
             ImageFormat::Png => cropped.save_with_format(&output_path, image::ImageFormat::Png)?,

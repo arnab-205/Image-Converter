@@ -1,5 +1,8 @@
 /// Tauri Commands for PDF Operations
-use crate::pdf_processor::{ImageFormat, PdfDocument, PdfLayer, PageInfo, PageObjectInfo, ExtractedImage};
+use crate::pdf_processor::{
+    ExtractedImage, ImageFormat, PageInfo, PageObjectInfo, PageOrganizationItem,
+    PdfDocument, PdfLayer,
+};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -71,6 +74,42 @@ pub struct ExportSelectedRegionRequest {
     pub transparent_bg: bool,
     #[serde(default)]
     pub selected_object_indices: Vec<usize>,
+    #[serde(default)]
+    pub selected_form_object_indices: Vec<usize>,
+    #[serde(default)]
+    pub hidden_object_indices: Vec<usize>,
+    #[serde(default)]
+    pub selected_text_bounds: Vec<[f64; 4]>,
+    #[serde(default)]
+    pub hide_unselected_text: bool,
+    #[serde(default)]
+    pub resize_width: Option<u32>,
+    #[serde(default)]
+    pub resize_height: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct PreviewSelectedRegionRequest {
+    pub page_index: usize,
+    pub bounds: [f64; 4],
+    #[serde(default)]
+    pub hide_text: bool,
+    #[serde(default)]
+    pub transparent_bg: bool,
+    #[serde(default)]
+    pub selected_object_indices: Vec<usize>,
+    #[serde(default)]
+    pub selected_form_object_indices: Vec<usize>,
+    #[serde(default)]
+    pub hidden_object_indices: Vec<usize>,
+    #[serde(default)]
+    pub selected_text_bounds: Vec<[f64; 4]>,
+    #[serde(default)]
+    pub hide_unselected_text: bool,
+    #[serde(default)]
+    pub resize_width: Option<u32>,
+    #[serde(default)]
+    pub resize_height: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +128,11 @@ pub struct CropObjectRequest {
 pub struct InsertImageAsPageRequest {
     pub image_path: String,
     pub position: usize,
+}
+
+#[derive(Deserialize)]
+pub struct ApplyPageOrganizationRequest {
+    pub items: Vec<PageOrganizationItem>,
 }
 
 // ── Helpers ──
@@ -155,31 +199,36 @@ fn encode_image_png_base64(image: &image::DynamicImage) -> Result<String, String
 // ── TAURI COMMANDS ──
 
 #[tauri::command]
-pub fn pdf_load(
+pub async fn pdf_load(
     file_path: String,
     state: State<'_, CurrentPdf>,
 ) -> Result<LoadPdfResponse, String> {
-    match PdfDocument::load(&file_path) {
-        Ok(pdf) => {
-            let metadata = pdf
-                .get_metadata()
-                .map_err(|e| format!("Failed to get metadata: {}", e))?;
-            let pages = pdf
-                .get_pages()
-                .map_err(|e| format!("Failed to get pages: {}", e))?;
+    let file_path_for_load = file_path.clone();
+    let response = with_pdf_blocking(file_path_for_load, move |pdf| {
+        let metadata = pdf
+            .get_metadata()
+            .map_err(|e| format!("Failed to get metadata: {}", e))?;
+        let pages = pdf
+            .get_pages()
+            .map_err(|e| format!("Failed to get pages: {}", e))?;
 
+        Ok(LoadPdfResponse {
+            success: true,
+            message: "PDF loaded successfully".to_string(),
+            metadata: Some(metadata),
+            pages: Some(pages),
+        })
+    })
+    .await;
+
+    match response {
+        Ok(response) => {
             *state.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(file_path);
-
-            Ok(LoadPdfResponse {
-                success: true,
-                message: "PDF loaded successfully".to_string(),
-                metadata: Some(metadata),
-                pages: Some(pages),
-            })
+            Ok(response)
         }
-        Err(e) => Ok(LoadPdfResponse {
+        Err(err) => Ok(LoadPdfResponse {
             success: false,
-            message: format!("Failed to load PDF: {}", e),
+            message: format!("Failed to load PDF: {}", err),
             metadata: None,
             pages: None,
         }),
@@ -187,30 +236,35 @@ pub fn pdf_load(
 }
 
 #[tauri::command]
-pub fn pdf_get_layers(state: State<'_, CurrentPdf>) -> Result<Vec<PdfLayer>, String> {
-    with_pdf(&state, |pdf| {
+pub async fn pdf_get_layers(state: State<'_, CurrentPdf>) -> Result<Vec<PdfLayer>, String> {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
         pdf.get_layers().map_err(|e| format!("Failed to get layers: {}", e))
     })
+    .await
 }
 
 #[tauri::command]
-pub fn pdf_get_pages(state: State<'_, CurrentPdf>) -> Result<Vec<PageInfo>, String> {
-    with_pdf(&state, |pdf| {
+pub async fn pdf_get_pages(state: State<'_, CurrentPdf>) -> Result<Vec<PageInfo>, String> {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
         pdf.get_pages().map_err(|e| format!("Failed to get pages: {}", e))
     })
+    .await
 }
 
 #[tauri::command]
-pub fn pdf_render_page(
+pub async fn pdf_render_page(
     request: RenderPageRequest,
     state: State<'_, CurrentPdf>,
 ) -> Result<RenderResponse, String> {
-    with_pdf(&state, |pdf| {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
         match pdf.render_page_to_image(
             request.page_index,
             request.width,
             request.height,
-            request.active_layers.clone().unwrap_or_default(),
+            request.active_layers.unwrap_or_default(),
             &request.hidden_object_indices,
         ) {
             Ok(image) => {
@@ -228,16 +282,18 @@ pub fn pdf_render_page(
             }),
         }
     })
+    .await
 }
 
 /// Generate thumbnails for all pages (small JPEG, ~150px wide)
 #[tauri::command]
-pub fn pdf_get_thumbnails(
+pub async fn pdf_get_thumbnails(
     thumb_width: Option<u32>,
     state: State<'_, CurrentPdf>,
 ) -> Result<Vec<ThumbnailItem>, String> {
+    let path = current_pdf_path(&state)?;
     let width = thumb_width.unwrap_or(150);
-    with_pdf(&state, |pdf| {
+    with_pdf_blocking(path, move |pdf| {
         let pages = pdf.get_pages().map_err(|e| format!("{}", e))?;
         let mut thumbnails = Vec::with_capacity(pages.len());
         for page_info in &pages {
@@ -250,7 +306,6 @@ pub fn pdf_get_thumbnails(
                     });
                 }
                 Err(_) => {
-                    // Placeholder for failed thumbnails
                     thumbnails.push(ThumbnailItem {
                         index: page_info.index,
                         data: String::new(),
@@ -260,6 +315,7 @@ pub fn pdf_get_thumbnails(
         }
         Ok(thumbnails)
     })
+    .await
 }
 
 #[tauri::command]
@@ -310,63 +366,84 @@ pub fn pdf_unload(state: State<'_, CurrentPdf>) {
 
 /// Delete pages by 0-based indices. Returns refreshed page list.
 #[tauri::command]
-pub fn pdf_delete_pages(
+pub async fn pdf_delete_pages(
     page_indices: Vec<usize>,
     state: State<'_, CurrentPdf>,
 ) -> Result<Vec<PageInfo>, String> {
-    with_pdf(&state, |pdf| {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
         pdf.delete_pages(&page_indices)
             .map_err(|e| format!("Failed to delete pages: {}", e))?;
-        // Reload to get updated page list
         let refreshed = PdfDocument::load(pdf.path())
             .map_err(|e| format!("{}", e))?;
         refreshed.get_pages().map_err(|e| format!("{}", e))
     })
+    .await
+}
+
+/// Apply the staged organize-pages draft in one pass and return refreshed pages.
+#[tauri::command]
+pub async fn pdf_apply_page_organization(
+    request: ApplyPageOrganizationRequest,
+    state: State<'_, CurrentPdf>,
+) -> Result<Vec<PageInfo>, String> {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
+        pdf.apply_page_organization(&request.items)
+            .map_err(|e| format!("Failed to apply page organization: {}", e))
+    })
+    .await
 }
 
 /// Reorder pages. `new_order` is 0-based indices in desired order.
 /// Returns refreshed page list.
 #[tauri::command]
-pub fn pdf_reorder_pages(
+pub async fn pdf_reorder_pages(
     new_order: Vec<usize>,
     state: State<'_, CurrentPdf>,
 ) -> Result<Vec<PageInfo>, String> {
-    with_pdf(&state, |pdf| {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
         pdf.reorder_pages(&new_order)
             .map_err(|e| format!("Failed to reorder pages: {}", e))?;
         let refreshed = PdfDocument::load(pdf.path())
             .map_err(|e| format!("{}", e))?;
         refreshed.get_pages().map_err(|e| format!("{}", e))
     })
+    .await
 }
 
 /// Insert a blank page at `position` (0-based). Returns refreshed page list.
 #[tauri::command]
-pub fn pdf_insert_blank_page(
+pub async fn pdf_insert_blank_page(
     position: usize,
     state: State<'_, CurrentPdf>,
 ) -> Result<Vec<PageInfo>, String> {
-    with_pdf(&state, |pdf| {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
         pdf.insert_blank_page(position)
             .map_err(|e| format!("Failed to insert blank page: {}", e))?;
         let refreshed = PdfDocument::load(pdf.path())
             .map_err(|e| format!("{}", e))?;
         refreshed.get_pages().map_err(|e| format!("{}", e))
     })
+    .await
 }
 
 // ── Image extraction commands ──
 
 /// Get a list of all objects on a page (images, text, paths, etc.)
 #[tauri::command]
-pub fn pdf_get_page_objects(
+pub async fn pdf_get_page_objects(
     page_index: usize,
     state: State<'_, CurrentPdf>,
 ) -> Result<Vec<PageObjectInfo>, String> {
-    with_pdf(&state, |pdf| {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
         pdf.get_page_objects(page_index)
             .map_err(|e| format!("Failed to get page objects: {}", e))
     })
+    .await
 }
 
 /// Extract all images embedded in a specific page.
@@ -434,9 +511,42 @@ pub async fn pdf_export_selected_region(
             request.hide_text,
             request.transparent_bg,
             &request.selected_object_indices,
+            &request.selected_form_object_indices,
+            &request.hidden_object_indices,
+            &request.selected_text_bounds,
+            request.hide_unselected_text,
+            request.resize_width,
+            request.resize_height,
         )
         .map(|_| true)
         .map_err(|e| format!("Failed to export region: {}", e))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn pdf_preview_selected_region(
+    request: PreviewSelectedRegionRequest,
+    state: State<'_, CurrentPdf>,
+) -> Result<String, String> {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
+        let image = pdf
+            .render_selected_region_image(
+                request.page_index,
+                request.bounds,
+                request.hide_text,
+                request.transparent_bg,
+                &request.selected_object_indices,
+                &request.selected_form_object_indices,
+                &request.hidden_object_indices,
+                &request.selected_text_bounds,
+                request.hide_unselected_text,
+                request.resize_width,
+                request.resize_height,
+            )
+            .map_err(|e| format!("Failed to preview region: {}", e))?;
+        encode_image_png_base64(&image)
     })
     .await
 }
@@ -463,14 +573,20 @@ pub async fn pdf_crop_object(
 
 /// Insert an image file as a new PDF page at the specified position.
 #[tauri::command]
-pub fn pdf_insert_image_as_page(
+pub async fn pdf_insert_image_as_page(
     request: InsertImageAsPageRequest,
     state: State<'_, CurrentPdf>,
 ) -> Result<Vec<PageInfo>, String> {
-    with_pdf(&state, |pdf| {
+    let path = current_pdf_path(&state)?;
+    with_pdf_blocking(path, move |pdf| {
         pdf.insert_image_as_page(&request.image_path, request.position)
             .map_err(|e| format!("Failed to insert image as page: {}", e))?;
-        pdf.get_pages().map_err(|e| format!("Failed to get pages: {}", e))
+        let refreshed = PdfDocument::load(pdf.path())
+            .map_err(|e| format!("{}", e))?;
+        refreshed
+            .get_pages()
+            .map_err(|e| format!("Failed to get pages: {}", e))
     })
+    .await
 }
 

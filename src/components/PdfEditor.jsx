@@ -108,10 +108,32 @@ const IconEyeOff = () => (
   </svg>
 );
 
-const GROUPABLE_OBJECT_TYPES = new Set(["path", "shading", "form"]);
+const GROUPABLE_OBJECT_TYPES = new Set(["path", "shading"]);
 const GROUP_CLUSTER_TYPES = new Set(["path", "shading"]);
 const SHAPE_OBJECT_TYPES = new Set(["path", "shading", "form"]);
 const MANUAL_GROUPS_STORAGE_PREFIX = "pdf-editor-manual-groups:";
+const TEXT_OBJECT_INDEX_BASE = 100_000;
+
+function isSyntheticTextObjectIndex(index) {
+  return Number.isInteger(index) && index >= TEXT_OBJECT_INDEX_BASE;
+}
+
+function normalizePdfBounds(bounds) {
+  if (!Array.isArray(bounds) || bounds.length !== 4) return null;
+
+  const left = Math.min(bounds[0], bounds[2]);
+  const right = Math.max(bounds[0], bounds[2]);
+  const bottom = Math.min(bounds[1], bounds[3]);
+  const top = Math.max(bounds[1], bounds[3]);
+
+  if (!Number.isFinite(left) || !Number.isFinite(right) || !Number.isFinite(bottom) || !Number.isFinite(top)) {
+    return null;
+  }
+
+  if (right - left < 0.5 || top - bottom < 0.5) return null;
+
+  return [left, bottom, right, top];
+}
 
 function getManualGroupsStorageKey(pdfPath) {
   return `${MANUAL_GROUPS_STORAGE_PREFIX}${pdfPath}`;
@@ -184,6 +206,20 @@ function getObjectByIndex(pageObjects, idx) {
   return pageObjects.find((obj) => obj.index === idx) || null;
 }
 
+function getNonFormParentObject(pageObjects, obj) {
+  if (!obj || obj.parent_index == null) return null;
+  const parent = getObjectByIndex(pageObjects, obj.parent_index);
+  return parent?.object_type === "form" ? null : parent;
+}
+
+function getNonFormChildIndices(pageObjects, obj) {
+  if (!obj || obj.object_type === "form" || !Array.isArray(obj.children)) return [];
+  return obj.children.filter((childIdx) => {
+    const child = getObjectByIndex(pageObjects, childIdx);
+    return Boolean(child) && child.object_type !== "form";
+  });
+}
+
 function boundsAreRelated(boundsA, boundsB) {
   if (!boundsA || !boundsB) return false;
 
@@ -249,17 +285,21 @@ function expandedBoundsOverlap(boundsA, boundsB, padding) {
   );
 }
 
-function areObjectsStructurallyRelated(objA, objB) {
+function areObjectsStructurallyRelated(pageObjects, objA, objB) {
   if (!objA || !objB) return false;
   if (objA.index === objB.index) return true;
 
-  const aChildren = Array.isArray(objA.children) ? objA.children : [];
-  const bChildren = Array.isArray(objB.children) ? objB.children : [];
+  if (objA.object_type === "form" || objB.object_type === "form") return false;
+
+  const parentA = getNonFormParentObject(pageObjects, objA);
+  const parentB = getNonFormParentObject(pageObjects, objB);
+  const aChildren = getNonFormChildIndices(pageObjects, objA);
+  const bChildren = getNonFormChildIndices(pageObjects, objB);
 
   if (aChildren.includes(objB.index) || bChildren.includes(objA.index)) return true;
-  if (objA.parent_index != null && objA.parent_index === objB.index) return true;
-  if (objB.parent_index != null && objB.parent_index === objA.index) return true;
-  if (objA.parent_index != null && objA.parent_index === objB.parent_index) return true;
+  if (parentA && parentA.index === objB.index) return true;
+  if (parentB && parentB.index === objA.index) return true;
+  if (parentA && parentB && parentA.index === parentB.index) return true;
 
   return false;
 }
@@ -359,14 +399,17 @@ function createGroupDefinition(pageObjects, memberIndices, index, options = {}) 
 function getVisibilityBundleIndicesForObjects(pageObjects, idx) {
   const target = getObjectByIndex(pageObjects, idx);
   if (!target) return [idx];
+  if (target.object_type === "form") return [idx];
 
   const bundle = new Set([idx]);
+  const targetParent = getNonFormParentObject(pageObjects, target);
+  const targetChildren = getNonFormChildIndices(pageObjects, target);
 
-  if (target.parent_index != null) {
-    bundle.add(target.parent_index);
+  if (targetParent) {
+    bundle.add(targetParent.index);
   }
-  if (target.children && target.children.length > 0) {
-    for (const childIdx of target.children) {
+  if (targetChildren.length > 0) {
+    for (const childIdx of targetChildren) {
       bundle.add(childIdx);
     }
   }
@@ -379,11 +422,14 @@ function getVisibilityBundleIndicesForObjects(pageObjects, idx) {
 
   for (const candidate of pageObjects) {
     if (candidate.index === idx || !candidate.bounds) continue;
+    if (candidate.object_type === "form") continue;
+
+    const candidateParent = getNonFormParentObject(pageObjects, candidate);
 
     const sameParent =
-      target.parent_index != null && candidate.parent_index === target.parent_index;
+      targetParent != null && candidateParent != null && candidateParent.index === targetParent.index;
     const parentChildLink =
-      candidate.index === target.parent_index || candidate.parent_index === target.index;
+      candidate.index === targetParent?.index || candidateParent?.index === target.index;
     const candidateIsVectorLike = GROUPABLE_OBJECT_TYPES.has(candidate.object_type);
 
     if (!(targetIsVectorLike && candidateIsVectorLike) && !sameParent && !parentChildLink) {
@@ -476,6 +522,15 @@ export default function PdfEditor({ onBack }) {
   const [imagesLoading, setImagesLoading] = useState(false);
   const [imagesSaveFormat, setImagesSaveFormat] = useState("png");
   const [transparentBg, setTransparentBg] = useState(true);
+  const [selectionExportMode, setSelectionExportMode] = useState("normal");
+  const [exportPreviewUrl, setExportPreviewUrl] = useState("");
+  const [exportPreviewError, setExportPreviewError] = useState("");
+  const [isExportPreviewLoading, setIsExportPreviewLoading] = useState(false);
+  const [selectionResizeEnabled, setSelectionResizeEnabled] = useState(false);
+  const [selectionResizeMode, setSelectionResizeMode] = useState("percentage");
+  const [selectionResizeMaintainAspect, setSelectionResizeMaintainAspect] = useState(true);
+  const [selectionResizePercent, setSelectionResizePercent] = useState({ width: "100", height: "100" });
+  const [selectionResizePixels, setSelectionResizePixels] = useState({ width: "", height: "" });
   const [pageObjects, setPageObjects] = useState([]);
   const [hoveredObjectIdx, setHoveredObjectIdx] = useState(null);
   const [hoveredGroupIndices, setHoveredGroupIndices] = useState(new Set());
@@ -485,6 +540,8 @@ export default function PdfEditor({ onBack }) {
   const [objectFilter, setObjectFilter] = useState("all"); // all | image | text | path | exportable
   const [layerViewMode, setLayerViewMode] = useState("objects"); // objects | groups
   const [manualGroupsByPage, setManualGroupsByPage] = useState({});
+  const [manualBoundsByPage, setManualBoundsByPage] = useState({});
+  const [boundsEditTargetIdx, setBoundsEditTargetIdx] = useState(null);
   const imgRef = useRef(null);
   const canvasRef = useRef(null);
   const [imgNaturalSize, setImgNaturalSize] = useState({ w: 0, h: 0 });
@@ -499,6 +556,11 @@ export default function PdfEditor({ onBack }) {
   const [marqueeActive, setMarqueeActive] = useState(false);
   const [marqueeStart, setMarqueeStart] = useState(null); // {x, y} in display coords
   const [marqueeEnd, setMarqueeEnd] = useState(null);     // {x, y} in display coords
+  const [drawSelectionBounds, setDrawSelectionBounds] = useState(null);
+  const [drawSelectionSeedIndices, setDrawSelectionSeedIndices] = useState([]);
+  const [organizeDraftPages, setOrganizeDraftPages] = useState([]);
+  const [hasPendingOrganizeChanges, setHasPendingOrganizeChanges] = useState(false);
+  const [isSavingOrganizeChanges, setIsSavingOrganizeChanges] = useState(false);
 
   // Per-page download format for organize view
   const [downloadFormat, setDownloadFormat] = useState("png");
@@ -516,6 +578,7 @@ export default function PdfEditor({ onBack }) {
   const lastHiddenSignatureRef = useRef("");
   const objectRowRefs = useRef(new Map());
   const pendingSidebarFocusIdxRef = useRef(null);
+  const exportPreviewRequestIdRef = useRef(0);
 
   const isLoaded = !!metadata;
   const waitForNextPaint = useCallback(
@@ -523,6 +586,7 @@ export default function PdfEditor({ onBack }) {
     [],
   );
   const manualGroupsForPage = manualGroupsByPage[currentPageIndex] || [];
+  const manualBoundsForPage = manualBoundsByPage[currentPageIndex] || {};
 
   // ── Open PDF via native file dialog ──
   const handleOpenPdf = useCallback(async () => {
@@ -541,6 +605,8 @@ export default function PdfEditor({ onBack }) {
     setRenderedImage(null);
     setExportStatus("");
     setManualGroupsByPage(loadSavedManualGroups(filePath));
+    setManualBoundsByPage({});
+    setBoundsEditTargetIdx(null);
 
     try {
       const response = await invoke("pdf_load", { filePath });
@@ -735,6 +801,11 @@ export default function PdfEditor({ onBack }) {
     setExportStatus("");
     setCurrentPageIndex(0);
     setZoom(50);
+    setSelectionResizeEnabled(false);
+    setSelectionResizeMode("percentage");
+    setSelectionResizeMaintainAspect(true);
+    setSelectionResizePercent({ width: "100", height: "100" });
+    setSelectionResizePixels({ width: "", height: "" });
     setThumbnails([]);
     setExtractedImages([]);
     setPageObjects([]);
@@ -744,7 +815,14 @@ export default function PdfEditor({ onBack }) {
     setHoveredGroupIndices(new Set());
     setIsExporting(false);
     setExcludedChildren(new Set());
+    setDrawSelectionBounds(null);
+    setDrawSelectionSeedIndices([]);
+    setOrganizeDraftPages([]);
+    setHasPendingOrganizeChanges(false);
+    setIsSavingOrganizeChanges(false);
     setManualGroupsByPage({});
+    setManualBoundsByPage({});
+    setBoundsEditTargetIdx(null);
   }, []);
 
   // ── Load thumbnails ──
@@ -759,6 +837,174 @@ export default function PdfEditor({ onBack }) {
       setThumbsLoading(false);
     }
   }, []);
+
+  const createOrganizeExistingPages = useCallback((pagesToUse) => {
+    return pagesToUse.map((page) => ({
+      draftId: `existing-${page.index}`,
+      type: "existing",
+      originalIndex: page.index,
+      width: page.width,
+      height: page.height,
+    }));
+  }, []);
+
+  useEffect(() => {
+    if (!isLoaded) {
+      setOrganizeDraftPages([]);
+      setHasPendingOrganizeChanges(false);
+      setIsSavingOrganizeChanges(false);
+      return;
+    }
+    if (hasPendingOrganizeChanges) return;
+    setOrganizeDraftPages(createOrganizeExistingPages(pages));
+  }, [isLoaded, hasPendingOrganizeChanges, pages, createOrganizeExistingPages]);
+
+  const handleDraftMovePage = useCallback((fromIndex, direction) => {
+    const toIndex = fromIndex + direction;
+    setOrganizeDraftPages((prev) => {
+      if (toIndex < 0 || toIndex >= prev.length) return prev;
+      const next = [...prev];
+      [next[fromIndex], next[toIndex]] = [next[toIndex], next[fromIndex]];
+      return next;
+    });
+    setHasPendingOrganizeChanges(true);
+  }, []);
+
+  const handleDraftDragReorder = useCallback((fromIndex, toIndex) => {
+    if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return;
+    setOrganizeDraftPages((prev) => {
+      if (fromIndex >= prev.length || toIndex >= prev.length) return prev;
+      const next = [...prev];
+      const [removed] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, removed);
+      return next;
+    });
+    setHasPendingOrganizeChanges(true);
+  }, []);
+
+  const handleDraftDeletePage = useCallback((pageIndex) => {
+    setOrganizeDraftPages((prev) => {
+      if (prev.length <= 1) return prev;
+      return prev.filter((_, idx) => idx !== pageIndex);
+    });
+    setHasPendingOrganizeChanges(true);
+  }, []);
+
+  const handleDraftInsertBlankPage = useCallback((position) => {
+    const fallbackPage = pages[0] || { width: 595, height: 842 };
+    const nextDraftPage = {
+      draftId: `blank-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      type: "blank",
+      width: fallbackPage.width,
+      height: fallbackPage.height,
+      label: "Blank Page",
+    };
+
+    setOrganizeDraftPages((prev) => {
+      const insertAt = Math.max(0, Math.min(position, prev.length));
+      return [
+        ...prev.slice(0, insertAt),
+        nextDraftPage,
+        ...prev.slice(insertAt),
+      ];
+    });
+    setHasPendingOrganizeChanges(true);
+  }, [pages]);
+
+  const handleDraftAddImageAsPage = useCallback(async (position) => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const filePath = await open({
+        multiple: false,
+        filters: [
+          {
+            name: "Images",
+            extensions: ["png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif", "gif"],
+          },
+        ],
+      });
+      if (!filePath) return;
+
+      const imagePath = typeof filePath === "string" ? filePath : filePath.path;
+      if (!imagePath) return;
+
+      const fallbackPage = pages[0] || { width: 595, height: 842 };
+      const nextDraftPage = {
+        draftId: `image-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        type: "image",
+        imagePath,
+        width: fallbackPage.width,
+        height: fallbackPage.height,
+        label: imagePath.split(/[/\\]/).pop() || "Image Page",
+      };
+
+      setOrganizeDraftPages((prev) => {
+        const insertAt = Math.max(0, Math.min(position, prev.length));
+        return [
+          ...prev.slice(0, insertAt),
+          nextDraftPage,
+          ...prev.slice(insertAt),
+        ];
+      });
+      setHasPendingOrganizeChanges(true);
+    } catch (err) {
+      setError(`Add image as page failed: ${err}`);
+    }
+  }, [pages]);
+
+  const handleDiscardOrganizeChanges = useCallback(() => {
+    setOrganizeDraftPages(createOrganizeExistingPages(pages));
+    setHasPendingOrganizeChanges(false);
+    setExportStatus("Discarded unsaved page organization changes");
+  }, [pages, createOrganizeExistingPages]);
+
+  const handleSaveOrganizeChanges = useCallback(async () => {
+    if (!pdfPath || !hasPendingOrganizeChanges || isSavingOrganizeChanges) return;
+
+    const finalDraft = organizeDraftPages;
+
+    setIsSavingOrganizeChanges(true);
+    setError("");
+    setExportStatus("Saving page organization...");
+
+    try {
+      const latestPages = await invoke("pdf_apply_page_organization", {
+        request: {
+          items: finalDraft.map((draftPage) => ({
+            kind: draftPage.type,
+            original_index: draftPage.type === "existing" ? draftPage.originalIndex : null,
+            image_path: draftPage.type === "image" ? draftPage.imagePath : null,
+            width: draftPage.width ?? null,
+            height: draftPage.height ?? null,
+          })),
+        },
+      });
+
+      setPages(latestPages);
+      const movedCurrentPagePosition = finalDraft.findIndex((draftPage) => (
+        draftPage.type === "existing" && draftPage.originalIndex === currentPageIndex
+      ));
+      const nextCurrentIndex = latestPages.length > 0
+        ? movedCurrentPagePosition >= 0
+          ? Math.min(movedCurrentPagePosition, latestPages.length - 1)
+          : Math.min(currentPageIndex, latestPages.length - 1)
+        : 0;
+      setCurrentPageIndex(nextCurrentIndex);
+      setPageObjects([]);
+      setThumbnails([]);
+      setOrganizeDraftPages(createOrganizeExistingPages(latestPages));
+      setHasPendingOrganizeChanges(false);
+      setExportStatus("Saved page organization changes");
+      if (latestPages.length > 0 && activePanel !== "organize") {
+        void renderPage(nextCurrentIndex, activeLayers, latestPages, { suppressLoading: true });
+      }
+      void loadThumbnails();
+    } catch (err) {
+      setError(`Save page organization failed: ${err}`);
+    } finally {
+      setIsSavingOrganizeChanges(false);
+    }
+  }, [pdfPath, hasPendingOrganizeChanges, isSavingOrganizeChanges, organizeDraftPages, createOrganizeExistingPages, currentPageIndex, renderPage, activeLayers, activePanel, loadThumbnails]);
 
   // ── Page management ──
   const handleDeletePage = useCallback(async (pageIndex) => {
@@ -807,24 +1053,6 @@ export default function PdfEditor({ onBack }) {
   }, [pages, activeLayers, renderPage, loadThumbnails]);
 
   // ── Pointer-based drag reorder ──
-  const handleDragReorder = useCallback(async (fromIndex, toIndex) => {
-    if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return;
-    if (fromIndex >= pages.length || toIndex >= pages.length) return;
-
-    const order = pages.map((_, i) => i);
-    const [removed] = order.splice(fromIndex, 1);
-    order.splice(toIndex, 0, removed);
-
-    try {
-      const newPages = await invoke("pdf_reorder_pages", { newOrder: order });
-      setPages(newPages);
-      setCurrentPageIndex(toIndex);
-      loadThumbnails();
-    } catch (err) {
-      setError(`Reorder failed: ${err}`);
-    }
-  }, [pages, activeLayers, renderPage, loadThumbnails]);
-
   const getCardIdxFromPoint = useCallback((clientX, clientY) => {
     const els = document.elementsFromPoint(clientX, clientY);
     for (const el of els) {
@@ -896,7 +1124,7 @@ export default function PdfEditor({ onBack }) {
         // Hide ghost to hit-test final drop target
         const overIdx = getCardIdxFromPoint(upE.clientX, upE.clientY);
         if (overIdx !== null && overIdx !== dragFromIdxRef.current) {
-          handleDragReorder(dragFromIdxRef.current, overIdx);
+          handleDraftDragReorder(dragFromIdxRef.current, overIdx);
         }
       }
 
@@ -907,7 +1135,7 @@ export default function PdfEditor({ onBack }) {
 
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
-  }, [getCardIdxFromPoint, handleDragReorder]);
+  }, [getCardIdxFromPoint, handleDraftDragReorder]);
 
   // ── Download a specific page as image ──
   const handleDownloadPage = useCallback(async (pageIndex, format) => {
@@ -1000,35 +1228,62 @@ export default function PdfEditor({ onBack }) {
     }
   }, []);
 
+  const applyManualBoundsToObjects = useCallback((objects, pageIndex) => {
+    const overrides = manualBoundsByPage[pageIndex];
+    if (!overrides || Object.keys(overrides).length === 0) return objects;
+
+    return objects.map((obj) => {
+      const override = overrides[obj.index];
+      if (!override?.editedBounds) return obj;
+      return {
+        ...obj,
+        bounds: [...override.editedBounds],
+      };
+    });
+  }, [manualBoundsByPage]);
+
   // ── Fetch page objects (for bounding box overlay) ──
   const fetchPageObjects = useCallback(async (pageIndex) => {
     try {
       const objs = await invoke("pdf_get_page_objects", { pageIndex });
-      setPageObjects(objs);
+      setPageObjects(applyManualBoundsToObjects(objs, pageIndex));
       setHiddenObjectIndices(new Set());
       setSelectedObjectIndices(new Set());
+      setDrawSelectionBounds(null);
+      setDrawSelectionSeedIndices([]);
       setExcludedChildren(new Set());
       setHoveredObjectIdx(null);
       setHoveredGroupIndices(new Set());
+      setBoundsEditTargetIdx(null);
+      setExportPreviewUrl("");
+      setExportPreviewError("");
     } catch (err) {
       console.error("Failed to get page objects:", err);
       setPageObjects([]);
       setHiddenObjectIndices(new Set());
+      setDrawSelectionBounds(null);
+      setDrawSelectionSeedIndices([]);
       setHoveredGroupIndices(new Set());
+      setBoundsEditTargetIdx(null);
+      setExportPreviewUrl("");
+      setExportPreviewError("");
     }
-  }, []);
+  }, [applyManualBoundsToObjects]);
 
-  // Auto-fetch page objects when switching to images panel or changing page
+  // Auto-fetch page objects when switching to image-driven panels or changing page.
   useEffect(() => {
-    if (activePanel === "images" && isLoaded) {
+    if ((activePanel === "images" || activePanel === "export") && isLoaded) {
       fetchPageObjects(currentPageIndex);
-      setExtractedImages([]);
+      if (activePanel === "images") {
+        setExtractedImages([]);
+      }
     } else {
       setPageObjects([]);
       setSelectedObjectIndices(new Set());
       setHiddenObjectIndices(new Set());
       setHoveredObjectIdx(null);
       setHoveredGroupIndices(new Set());
+      setBoundsEditTargetIdx(null);
     }
   }, [activePanel, currentPageIndex, isLoaded, fetchPageObjects]);
 
@@ -1108,21 +1363,23 @@ export default function PdfEditor({ onBack }) {
     if (object && willSelect) {
       setLayerViewMode("objects");
 
-      if (object.object_type === "text") {
-        setObjectFilter("text");
-      } else if (object.object_type === "image") {
-        setObjectFilter("image");
-      } else if (SHAPE_OBJECT_TYPES.has(object.object_type)) {
-        setObjectFilter("path");
-      } else {
-        setObjectFilter("all");
+      if (objectFilter !== "all") {
+        if (object.object_type === "text") {
+          setObjectFilter("text");
+        } else if (object.object_type === "image") {
+          setObjectFilter("image");
+        } else if (SHAPE_OBJECT_TYPES.has(object.object_type)) {
+          setObjectFilter("path");
+        } else {
+          setObjectFilter("all");
+        }
       }
 
       pendingSidebarFocusIdxRef.current = idx;
     }
 
     toggleObjectSelection(idx);
-  }, [hiddenObjectIndices, pageObjects, selectedObjectIndices, toggleObjectSelection]);
+  }, [hiddenObjectIndices, pageObjects, selectedObjectIndices, objectFilter, toggleObjectSelection]);
 
   const getVisibilityBundleIndices = useCallback(
     (idx) => getVisibilityBundleIndicesForObjects(pageObjects, idx),
@@ -1202,32 +1459,120 @@ export default function PdfEditor({ onBack }) {
     setHoveredObjectIdx((prev) => (bundleIndices.includes(prev) ? null : prev));
   }, [getVisibilityBundleIndices]);
 
-  // ── Marquee selection complete: select all exportable objects in the drawn rectangle ──
-  const EXPORTABLE_TYPES = new Set(["image", "path", "shading"]);
-  const handleMarqueeComplete = useCallback((rectDisplay) => {
-    if (!imgRef.current || !pages[currentPageIndex]) return;
+  const getDisplayRectPdfBounds = useCallback((rectDisplay) => {
+    if (!imgRef.current || !pages[currentPageIndex]) return null;
+
     const displayW = imgRef.current.clientWidth;
     const displayH = imgRef.current.clientHeight;
     const pw = pages[currentPageIndex].width;
     const ph = pages[currentPageIndex].height;
-    if (!displayW || !displayH || !pw || !ph) return;
+    if (!displayW || !displayH || !pw || !ph) return null;
 
     const scaleX = displayW / pw;
     const scaleY = displayH / ph;
+
+    return normalizePdfBounds([
+      rectDisplay.x / scaleX,
+      ph - ((rectDisplay.y + rectDisplay.h) / scaleY),
+      (rectDisplay.x + rectDisplay.w) / scaleX,
+      ph - (rectDisplay.y / scaleY),
+    ]);
+  }, [pages, currentPageIndex]);
+
+  const handleStartBoundsEdit = useCallback((objectIndex) => {
+    const target = pageObjects.find((obj) => obj.index === objectIndex);
+    if (!target?.bounds) return;
+
+    setBoundsEditTargetIdx(objectIndex);
+    setShowObjectOverlay(true);
+    setObjectFilter("all");
+    setLayerViewMode("objects");
+    setExportStatus(`Draw a replacement box for ${target.object_type} #${isSyntheticTextObjectIndex(objectIndex) ? objectIndex - TEXT_OBJECT_INDEX_BASE + 1 : objectIndex}`);
+  }, [pageObjects]);
+
+  const handleApplyBoundsEdit = useCallback((objectIndex, nextBounds) => {
+    const normalized = normalizePdfBounds(nextBounds);
+    if (!normalized) return;
+
+    const target = pageObjects.find((obj) => obj.index === objectIndex);
+    if (!target?.bounds) return;
+
+    setPageObjects((prev) => prev.map((obj) => (
+      obj.index === objectIndex
+        ? { ...obj, bounds: [...normalized] }
+        : obj
+    )));
+
+    setManualBoundsByPage((prev) => {
+      const pageOverrides = prev[currentPageIndex] || {};
+      const existing = pageOverrides[objectIndex];
+      const originalBounds = existing?.originalBounds || [...target.bounds];
+      return {
+        ...prev,
+        [currentPageIndex]: {
+          ...pageOverrides,
+          [objectIndex]: {
+            originalBounds: [...originalBounds],
+            editedBounds: [...normalized],
+          },
+        },
+      };
+    });
+
+    setBoundsEditTargetIdx(null);
+    setExportStatus("Updated object bounds");
+  }, [currentPageIndex, pageObjects]);
+
+  const handleResetBoundsEdit = useCallback((objectIndex) => {
+    const override = manualBoundsForPage[objectIndex];
+    if (!override?.originalBounds) return;
+
+    setPageObjects((prev) => prev.map((obj) => (
+      obj.index === objectIndex
+        ? { ...obj, bounds: [...override.originalBounds] }
+        : obj
+    )));
+
+    setManualBoundsByPage((prev) => {
+      const pageOverrides = prev[currentPageIndex] || {};
+      const { [objectIndex]: _removed, ...restPageOverrides } = pageOverrides;
+
+      if (Object.keys(restPageOverrides).length === 0) {
+        const { [currentPageIndex]: _removedPage, ...rest } = prev;
+        return rest;
+      }
+
+      return {
+        ...prev,
+        [currentPageIndex]: restPageOverrides,
+      };
+    });
+
+    setBoundsEditTargetIdx(null);
+    setExportStatus("Restored original object bounds");
+  }, [currentPageIndex, manualBoundsForPage]);
+
+  // ── Marquee selection complete: select all exportable objects in the drawn rectangle ──
+  const EXPORTABLE_TYPES = new Set(["image", "path", "shading", "text"]);
+  const handleMarqueeComplete = useCallback((rectDisplay) => {
+    if (!pages[currentPageIndex]) return;
+    const pw = pages[currentPageIndex].width;
+    const ph = pages[currentPageIndex].height;
+    if (!pw || !ph) return;
     const pageArea = pw * ph;
 
-    // Convert marquee display rect → PDF coords
-    const pdfLeft   = rectDisplay.x / scaleX;
-    const pdfRight  = (rectDisplay.x + rectDisplay.w) / scaleX;
-    const pdfTop    = ph - (rectDisplay.y / scaleY);
-    const pdfBottom = ph - ((rectDisplay.y + rectDisplay.h) / scaleY);
+    const pdfBounds = getDisplayRectPdfBounds(rectDisplay);
+    if (!pdfBounds) return;
+    const [pdfLeft, pdfBottom, pdfRight, pdfTop] = pdfBounds;
 
     const selected = new Set();
     for (const obj of pageObjects) {
       if (hiddenObjectIndices.has(obj.index)) continue;
       if (!obj.bounds || !EXPORTABLE_TYPES.has(obj.object_type)) continue;
       const [l, b, r, t] = obj.bounds;
-      // Filter out full-page backgrounds
+      // Filter out full-page backgrounds from the *selection set*.
+      // The drawn crop still captures them for As-is / background exports,
+      // but transparent exports should not auto-include these primitives.
       const areaRatio = ((r - l) * (t - b)) / pageArea;
       if (obj.object_type === "image" && areaRatio > 0.85) continue;
       if (obj.object_type === "path" && areaRatio > 0.7) continue;
@@ -1237,9 +1582,11 @@ export default function PdfEditor({ onBack }) {
       }
     }
     if (selected.size > 0) {
+      setDrawSelectionBounds([...pdfBounds]);
+      setDrawSelectionSeedIndices(Array.from(selected).sort((a, b) => a - b));
       setSelectedObjectIndices(selected);
     }
-  }, [pageObjects, pages, currentPageIndex, hiddenObjectIndices]);
+  }, [pageObjects, pages, currentPageIndex, hiddenObjectIndices, getDisplayRectPdfBounds]);
 
   useEffect(() => {
     if (activePanel !== "images" || layerViewMode !== "objects") return;
@@ -1257,14 +1604,38 @@ export default function PdfEditor({ onBack }) {
     return () => cancelAnimationFrame(frameId);
   }, [activePanel, layerViewMode, objectFilter, selectedObjectIndices, currentPageIndex]);
 
-  // ── Compute union bounding box of selected objects (excludes text) ──
+  useEffect(() => {
+    if (boundsEditTargetIdx == null) return;
+    if (hiddenObjectIndices.has(boundsEditTargetIdx) || !selectedObjectIndices.has(boundsEditTargetIdx)) {
+      setBoundsEditTargetIdx(null);
+    }
+  }, [boundsEditTargetIdx, hiddenObjectIndices, selectedObjectIndices]);
+
+  // ── Compute union bounding box of selected objects ──
   const getSelectedBounds = useCallback(() => {
     const selected = pageObjects.filter(
-      (o) => selectedObjectIndices.has(o.index) && !hiddenObjectIndices.has(o.index) && o.bounds && o.object_type !== "text"
+      (o) => selectedObjectIndices.has(o.index) && !hiddenObjectIndices.has(o.index) && o.bounds
     );
     if (selected.length === 0) return null;
-    let [minL, minB, maxR, maxT] = selected[0].bounds;
-    for (const obj of selected.slice(1)) {
+
+    let boundsSource = selected;
+    const page = pages[currentPageIndex];
+    if (page && selected.length > 1) {
+      const pageArea = page.width * page.height;
+      const foregroundSelected = selected.filter((obj) => {
+        if (obj.object_type !== "image") return true;
+        const [left, bottom, right, top] = obj.bounds;
+        const areaRatio = ((right - left) * (top - bottom)) / pageArea;
+        return areaRatio <= 0.85;
+      });
+
+      if (foregroundSelected.length > 0) {
+        boundsSource = foregroundSelected;
+      }
+    }
+
+    let [minL, minB, maxR, maxT] = boundsSource[0].bounds;
+    for (const obj of boundsSource.slice(1)) {
       const [l, b, r, t] = obj.bounds;
       minL = Math.min(minL, l);
       minB = Math.min(minB, b);
@@ -1272,7 +1643,7 @@ export default function PdfEditor({ onBack }) {
       maxT = Math.max(maxT, t);
     }
     return [minL, minB, maxR, maxT];
-  }, [pageObjects, selectedObjectIndices, hiddenObjectIndices]);
+  }, [pageObjects, selectedObjectIndices, hiddenObjectIndices, pages, currentPageIndex]);
 
   const getMergeableSelectedIndices = useCallback(() => {
     return pageObjects
@@ -1285,6 +1656,314 @@ export default function PdfEditor({ onBack }) {
       .map((obj) => obj.index)
       .sort((a, b) => a - b);
   }, [pageObjects, selectedObjectIndices, hiddenObjectIndices]);
+
+  const getSelectedPdfObjectIndices = useCallback(() => {
+    return Array.from(selectedObjectIndices)
+      .filter((idx) => !hiddenObjectIndices.has(idx) && !isSyntheticTextObjectIndex(idx))
+      .sort((a, b) => a - b);
+  }, [selectedObjectIndices, hiddenObjectIndices]);
+
+  const getSelectedTextBounds = useCallback(() => {
+    return pageObjects
+      .filter(
+        (obj) => obj.object_type === "text"
+          && selectedObjectIndices.has(obj.index)
+          && !hiddenObjectIndices.has(obj.index)
+          && obj.bounds,
+      )
+      .map((obj) => [...obj.bounds]);
+  }, [pageObjects, selectedObjectIndices, hiddenObjectIndices]);
+
+  const getSelectedFormObjectIndices = useCallback((indices = null) => {
+    const selectedSet = new Set(
+      Array.isArray(indices)
+        ? indices.filter((idx) => !hiddenObjectIndices.has(idx))
+        : Array.from(selectedObjectIndices).filter((idx) => !hiddenObjectIndices.has(idx)),
+    );
+
+    return pageObjects
+      .filter((obj) => obj.object_type === "form" && selectedSet.has(obj.index))
+      .map((obj) => obj.index)
+      .sort((a, b) => a - b);
+  }, [pageObjects, selectedObjectIndices, hiddenObjectIndices]);
+
+  const getComponentExportPlan = useCallback((options = {}) => {
+    const {
+      selectedIndices = Array.from(selectedObjectIndices),
+      baseBounds = null,
+    } = options;
+
+    const selectedSet = new Set(selectedIndices.filter((idx) => !hiddenObjectIndices.has(idx)));
+    const selectedRealObjects = pageObjects.filter(
+      (obj) => selectedSet.has(obj.index)
+        && !isSyntheticTextObjectIndex(obj.index)
+        && obj.bounds,
+    );
+    const selectedTextBounds = pageObjects
+      .filter(
+        (obj) => obj.object_type === "text"
+          && selectedSet.has(obj.index)
+          && obj.bounds,
+      )
+      .map((obj) => [...obj.bounds]);
+
+    const boundsEntries = [
+      ...selectedRealObjects.map((obj) => obj.bounds),
+      ...selectedTextBounds,
+    ];
+
+    let exportBounds = baseBounds;
+    if (!exportBounds && boundsEntries.length > 0) {
+      let [minL, minB, maxR, maxT] = boundsEntries[0];
+      for (const [l, b, r, t] of boundsEntries.slice(1)) {
+        minL = Math.min(minL, l);
+        minB = Math.min(minB, b);
+        maxR = Math.max(maxR, r);
+        maxT = Math.max(maxT, t);
+      }
+      exportBounds = [minL, minB, maxR, maxT];
+    }
+
+    const selectedRealIndices = new Set(selectedRealObjects.map((obj) => obj.index));
+    const hasSelectedFormObject = selectedRealObjects.some((obj) => obj.object_type === "form");
+    if (!exportBounds) {
+      return {
+        bounds: null,
+        selectedRealIndices: Array.from(selectedRealIndices).sort((a, b) => a - b),
+        selectedTextBounds,
+      };
+    }
+
+    if (selectedRealObjects.length === 0 && selectedTextBounds.length > 0) {
+      return {
+        bounds: exportBounds,
+        selectedRealIndices: [],
+        selectedTextBounds,
+      };
+    }
+
+    const exportMetrics = getBoundsMetrics(exportBounds);
+    const page = pages[currentPageIndex];
+    const pageArea = page ? page.width * page.height : 0;
+
+    if (!hasSelectedFormObject) {
+      for (const candidate of pageObjects) {
+        if (!candidate?.bounds || hiddenObjectIndices.has(candidate.index) || isSyntheticTextObjectIndex(candidate.index)) continue;
+        if (candidate.object_type === "text" || selectedRealIndices.has(candidate.index)) continue;
+
+        const candidateMetrics = getBoundsMetrics(candidate.bounds);
+        const containsExportBounds =
+          exportBounds[0] >= candidateMetrics.left - 1 &&
+          exportBounds[1] >= candidateMetrics.bottom - 1 &&
+          exportBounds[2] <= candidateMetrics.right + 1 &&
+          exportBounds[3] <= candidateMetrics.top + 1;
+
+        if (!containsExportBounds) continue;
+        if (pageArea > 0 && candidateMetrics.area / pageArea > 0.92) continue;
+        if (candidateMetrics.area / exportMetrics.area > 12) continue;
+
+        const relatedToSelection = selectedRealObjects.some((obj) => (
+          areObjectsStructurallyRelated(pageObjects, candidate, obj)
+          || boundsAreRelated(candidate.bounds, obj.bounds)
+          || expandedBoundsOverlap(candidate.bounds, obj.bounds, 1.5)
+        )) || selectedTextBounds.some((textBounds) => (
+          boundsAreRelated(candidate.bounds, textBounds)
+          || expandedBoundsOverlap(candidate.bounds, textBounds, 1.5)
+        ));
+
+        if (!relatedToSelection) continue;
+        selectedRealIndices.add(candidate.index);
+      }
+    }
+
+    const includedBounds = [
+      ...pageObjects
+        .filter((obj) => selectedRealIndices.has(obj.index) && obj.bounds)
+        .map((obj) => obj.bounds),
+      ...selectedTextBounds,
+    ];
+
+    if (includedBounds.length > 0) {
+      let [minL, minB, maxR, maxT] = includedBounds[0];
+      for (const [l, b, r, t] of includedBounds.slice(1)) {
+        minL = Math.min(minL, l);
+        minB = Math.min(minB, b);
+        maxR = Math.max(maxR, r);
+        maxT = Math.max(maxT, t);
+      }
+      exportBounds = [minL, minB, maxR, maxT];
+    }
+
+    return {
+      bounds: exportBounds,
+      selectedRealIndices: Array.from(selectedRealIndices).sort((a, b) => a - b),
+      selectedTextBounds,
+    };
+  }, [selectedObjectIndices, hiddenObjectIndices, pageObjects, pages, currentPageIndex]);
+
+  const getDrawSelectionHiddenPdfObjectIndices = useCallback((options = {}) => {
+    const {
+      stripBackground = false,
+      exportBounds = null,
+      selectedRealIndices = [],
+      hideAllOverlappingReal = false,
+    } = options;
+    const hidden = new Set(
+      Array.from(hiddenObjectIndices).filter((idx) => !isSyntheticTextObjectIndex(idx)),
+    );
+    const selectedRealSet = new Set(selectedRealIndices);
+
+    const suppressedTextBounds = drawSelectionSeedIndices
+      .filter((idx) => isSyntheticTextObjectIndex(idx) && !selectedObjectIndices.has(idx))
+      .map((idx) => getObjectByIndex(pageObjects, idx)?.bounds)
+      .filter(Boolean);
+
+    const seedRealObjectIndices = drawSelectionSeedIndices.filter((idx) => !isSyntheticTextObjectIndex(idx));
+    const page = pages[currentPageIndex];
+    const pageArea = page ? page.width * page.height : 0;
+
+    for (const idx of seedRealObjectIndices) {
+      if (!selectedRealSet.has(idx)) {
+        hidden.add(idx);
+      }
+    }
+
+    if (suppressedTextBounds.length > 0) {
+      for (const idx of seedRealObjectIndices) {
+        if (selectedRealSet.has(idx)) continue;
+        const candidate = getObjectByIndex(pageObjects, idx);
+        if (!candidate?.bounds || candidate.object_type === "image") continue;
+
+        const overlapsSuppressedText = suppressedTextBounds.some((textBounds) => (
+          expandedBoundsOverlap(candidate.bounds, textBounds, 1.5)
+          || boundsAreRelated(candidate.bounds, textBounds)
+        ));
+
+        if (overlapsSuppressedText) {
+          hidden.add(idx);
+        }
+      }
+    }
+
+    if (hideAllOverlappingReal && exportBounds) {
+      for (const candidate of pageObjects) {
+        if (!candidate?.bounds || isSyntheticTextObjectIndex(candidate.index)) continue;
+        if (candidate.object_type === "text") continue;
+        if (selectedRealSet.has(candidate.index)) continue;
+        if (!expandedBoundsOverlap(candidate.bounds, exportBounds, 0.5)) continue;
+        hidden.add(candidate.index);
+      }
+    }
+
+    if (stripBackground && pageArea > 0) {
+      for (const candidate of pageObjects) {
+        if (!candidate?.bounds || isSyntheticTextObjectIndex(candidate.index)) continue;
+        if (exportBounds && !expandedBoundsOverlap(candidate.bounds, exportBounds, 0.5)) continue;
+
+        const candidateMetrics = getBoundsMetrics(candidate.bounds);
+        const areaRatio = candidateMetrics.area / pageArea;
+        const isBackgroundPrimitive = candidate.object_type === "image"
+          ? areaRatio > 0.85
+          : ["path", "shading", "form"].includes(candidate.object_type)
+          ? areaRatio > 0.7
+          : false;
+
+        if (isBackgroundPrimitive) {
+          hidden.add(candidate.index);
+        }
+      }
+    }
+
+    return Array.from(hidden).sort((a, b) => a - b);
+  }, [drawSelectionSeedIndices, hiddenObjectIndices, selectedObjectIndices, pages, currentPageIndex, pageObjects]);
+
+  const getTransparentTextOnlyHiddenPdfObjectIndices = useCallback((exportBounds) => {
+    const hidden = new Set(
+      Array.from(hiddenObjectIndices).filter((idx) => !isSyntheticTextObjectIndex(idx)),
+    );
+
+    if (!exportBounds) {
+      return Array.from(hidden).sort((a, b) => a - b);
+    }
+
+    for (const candidate of pageObjects) {
+      if (!candidate?.bounds || isSyntheticTextObjectIndex(candidate.index)) continue;
+      if (candidate.object_type === "text") continue;
+      if (!expandedBoundsOverlap(candidate.bounds, exportBounds, 0.5)) continue;
+      hidden.add(candidate.index);
+    }
+
+    return Array.from(hidden).sort((a, b) => a - b);
+  }, [hiddenObjectIndices, pageObjects]);
+
+  const getBackgroundOnlyHiddenPdfObjectIndices = useCallback((exportBounds) => {
+    const hidden = new Set(
+      Array.from(hiddenObjectIndices).filter((idx) => !isSyntheticTextObjectIndex(idx)),
+    );
+
+    const page = pages[currentPageIndex];
+    const pageArea = page ? page.width * page.height : 0;
+    const seedRealObjectIndices = drawSelectionSeedIndices.filter((idx) => !isSyntheticTextObjectIndex(idx));
+
+    if (!exportBounds) {
+      return Array.from(hidden).sort((a, b) => a - b);
+    }
+
+    for (const idx of seedRealObjectIndices) {
+      if (selectedObjectIndices.has(idx)) continue;
+
+      const candidate = getObjectByIndex(pageObjects, idx);
+      if (!candidate?.bounds) continue;
+
+      const candidateMetrics = getBoundsMetrics(candidate.bounds);
+      const areaRatio = pageArea > 0 ? candidateMetrics.area / pageArea : 0;
+      const isBackgroundPrimitive = candidate.object_type === "image"
+        ? areaRatio > 0.85
+        : ["path", "shading", "form"].includes(candidate.object_type)
+        ? areaRatio > 0.7
+        : false;
+
+      if (!isBackgroundPrimitive) {
+        hidden.add(idx);
+      }
+    }
+
+    const exportMetrics = getBoundsMetrics(exportBounds);
+    const textBoundsInExport = pageObjects
+      .filter((obj) => obj.object_type === "text" && obj.bounds)
+      .map((obj) => obj.bounds)
+      .filter((bounds) => expandedBoundsOverlap(bounds, exportBounds, 0.5));
+
+    if (textBoundsInExport.length === 0) {
+      return Array.from(hidden).sort((a, b) => a - b);
+    }
+
+    for (const candidate of pageObjects) {
+      if (!candidate?.bounds || isSyntheticTextObjectIndex(candidate.index)) continue;
+      if (selectedObjectIndices.has(candidate.index)) continue;
+      if (candidate.object_type === "image") continue;
+      if (!SHAPE_OBJECT_TYPES.has(candidate.object_type)) continue;
+      if (!expandedBoundsOverlap(candidate.bounds, exportBounds, 0.5)) continue;
+
+      const candidateMetrics = getBoundsMetrics(candidate.bounds);
+      if (candidateMetrics.area / exportMetrics.area > 0.18) continue;
+
+      const relatedToText = textBoundsInExport.some((textBounds) => {
+        const textMetrics = getBoundsMetrics(textBounds);
+        const sizeRatio = Math.max(candidateMetrics.area, textMetrics.area) / Math.min(candidateMetrics.area, textMetrics.area);
+        return sizeRatio < 18 && (
+          expandedBoundsOverlap(candidate.bounds, textBounds, 1.5)
+          || boundsAreRelated(candidate.bounds, textBounds)
+        );
+      });
+
+      if (relatedToText) {
+        hidden.add(candidate.index);
+      }
+    }
+
+    return Array.from(hidden).sort((a, b) => a - b);
+  }, [hiddenObjectIndices, pages, currentPageIndex, drawSelectionSeedIndices, selectedObjectIndices, pageObjects]);
 
   const handleMergeSelectedIntoGroup = useCallback(() => {
     const mergeableIndices = getMergeableSelectedIndices();
@@ -1350,8 +2029,7 @@ export default function PdfEditor({ onBack }) {
       .filter(
         (obj) => selectedObjectIndices.has(obj.index)
           && !hiddenObjectIndices.has(obj.index)
-          && obj.bounds
-          && obj.object_type !== "text",
+          && obj.bounds,
       )
       .sort((a, b) => a.index - b.index);
 
@@ -1396,7 +2074,9 @@ export default function PdfEditor({ onBack }) {
       targets.push({
         label: obj.object_type === "image"
           ? `Image ${obj.image_width || ""}x${obj.image_height || ""}`.trim()
-          : `${obj.object_type} #${obj.index >= 100000 ? obj.index - 100000 + 1 : obj.index}`,
+          : obj.object_type === "text" && obj.text_content
+          ? `Text: ${obj.text_content.slice(0, 24)}${obj.text_content.length > 24 ? "..." : ""}`
+          : `${obj.object_type} #${isSyntheticTextObjectIndex(obj.index) ? obj.index - TEXT_OBJECT_INDEX_BASE + 1 : obj.index}`,
         indices: [obj.index],
         bounds: [...obj.bounds],
       });
@@ -1405,13 +2085,237 @@ export default function PdfEditor({ onBack }) {
     return targets;
   }, [pageObjects, selectedObjectIndices, hiddenObjectIndices, manualGroupsForPage]);
 
+  const getResizeBaseDimensions = useCallback((bounds) => {
+    const normalizedBounds = normalizePdfBounds(bounds);
+    if (!normalizedBounds) return null;
+
+    const [left, bottom, right, top] = normalizedBounds;
+    return {
+      width: Math.max(1, Math.round((right - left) * 3)),
+      height: Math.max(1, Math.round((top - bottom) * 3)),
+    };
+  }, []);
+
+  const getCurrentSelectionExportBaseRequest = useCallback(() => {
+    const effectiveSelectedIndices = Array.from(selectedObjectIndices).filter((idx) => !hiddenObjectIndices.has(idx));
+    if (effectiveSelectedIndices.length === 0 || !pdfPath) return null;
+
+    const isDrawSelectionExport = Boolean(drawSelectionBounds && drawSelectionSeedIndices.length > 0);
+    const selectedPdfObjectIndices = getSelectedPdfObjectIndices();
+    const selectedTextBounds = getSelectedTextBounds();
+    const baseBounds = isDrawSelectionExport ? drawSelectionBounds : getSelectedBounds();
+    if (!baseBounds) return null;
+
+    const isBackgroundOnlyExport = selectionExportMode === "background";
+    const isComponentExport = !transparentBg && !isBackgroundOnlyExport;
+    const componentExportPlan = !transparentBg && !isBackgroundOnlyExport
+      ? getComponentExportPlan({ selectedIndices: effectiveSelectedIndices, baseBounds })
+      : null;
+    const bounds = componentExportPlan?.bounds || baseBounds;
+    const componentSelectedPdfObjectIndices = componentExportPlan?.selectedRealIndices || selectedPdfObjectIndices;
+    const componentSelectedTextBounds = componentExportPlan?.selectedTextBounds || selectedTextBounds;
+    const selectedFormObjectIndices = getSelectedFormObjectIndices(effectiveSelectedIndices);
+    const isTextOnlySelectionExport = !isBackgroundOnlyExport && !isComponentExport
+      && componentSelectedPdfObjectIndices.length === 0
+      && componentSelectedTextBounds.length > 0;
+    const pdfObjectSelection = isBackgroundOnlyExport || isComponentExport
+      ? []
+      : componentSelectedPdfObjectIndices;
+    const hiddenPdfObjectIndices = isBackgroundOnlyExport
+      ? getBackgroundOnlyHiddenPdfObjectIndices(bounds)
+      : isTextOnlySelectionExport
+      ? getTransparentTextOnlyHiddenPdfObjectIndices(bounds)
+      : [];
+    const shouldHideText = isBackgroundOnlyExport;
+    const shouldHideUnselectedText = !isBackgroundOnlyExport;
+    const selectedTextBoundsPayload = !isBackgroundOnlyExport
+      ? componentSelectedTextBounds
+      : [];
+
+    return {
+      page_index: currentPageIndex,
+      bounds,
+      hide_text: shouldHideText,
+      transparent_bg: transparentBg,
+      selected_object_indices: pdfObjectSelection,
+      selected_form_object_indices: selectedFormObjectIndices,
+      hidden_object_indices: hiddenPdfObjectIndices,
+      selected_text_bounds: selectedTextBoundsPayload,
+      hide_unselected_text: shouldHideUnselectedText,
+    };
+  }, [selectedObjectIndices, hiddenObjectIndices, pdfPath, drawSelectionBounds, drawSelectionSeedIndices, getSelectedPdfObjectIndices, getSelectedTextBounds, getSelectedBounds, selectionExportMode, transparentBg, getComponentExportPlan, getBackgroundOnlyHiddenPdfObjectIndices, getTransparentTextOnlyHiddenPdfObjectIndices, currentPageIndex, getSelectedFormObjectIndices]);
+
+  const getSelectionResizeDimensions = useCallback((bounds) => {
+    if (!selectionResizeEnabled) return null;
+
+    const baseDimensions = getResizeBaseDimensions(bounds);
+    if (!baseDimensions) return null;
+
+    if (selectionResizeMode === "pixels") {
+      const parsedWidth = Number.parseInt(selectionResizePixels.width, 10);
+      const parsedHeight = Number.parseInt(selectionResizePixels.height, 10);
+      return {
+        width: Math.max(1, Number.isFinite(parsedWidth) ? parsedWidth : baseDimensions.width),
+        height: Math.max(1, Number.isFinite(parsedHeight) ? parsedHeight : baseDimensions.height),
+      };
+    }
+
+    const parsedWidthPercent = Number.parseInt(selectionResizePercent.width, 10);
+    const parsedHeightPercent = Number.parseInt(selectionResizePercent.height, 10);
+    const widthPercent = Math.max(1, Number.isFinite(parsedWidthPercent) ? parsedWidthPercent : 100);
+    const heightPercent = Math.max(1, Number.isFinite(parsedHeightPercent) ? parsedHeightPercent : 100);
+
+    return {
+      width: Math.max(1, Math.round((baseDimensions.width * widthPercent) / 100)),
+      height: Math.max(1, Math.round((baseDimensions.height * heightPercent) / 100)),
+    };
+  }, [selectionResizeEnabled, selectionResizeMode, selectionResizePixels, selectionResizePercent, getResizeBaseDimensions]);
+
+  const handleResetSelectionResize = useCallback(() => {
+    const baseRequest = getCurrentSelectionExportBaseRequest();
+    const baseDimensions = baseRequest ? getResizeBaseDimensions(baseRequest.bounds) : null;
+    setSelectionResizePercent({ width: "100", height: "100" });
+    setSelectionResizePixels(baseDimensions
+      ? { width: String(baseDimensions.width), height: String(baseDimensions.height) }
+      : { width: "", height: "" });
+  }, [getCurrentSelectionExportBaseRequest, getResizeBaseDimensions]);
+
+  const handleSelectionResizeModeChange = useCallback((mode) => {
+    setSelectionResizeMode(mode);
+    const baseRequest = getCurrentSelectionExportBaseRequest();
+    const baseDimensions = baseRequest ? getResizeBaseDimensions(baseRequest.bounds) : null;
+    if (!baseDimensions) return;
+
+    const currentOutputDimensions = getSelectionResizeDimensions(baseRequest.bounds) || baseDimensions;
+
+    if (mode === "pixels") {
+      setSelectionResizePixels({
+        width: String(currentOutputDimensions.width),
+        height: String(currentOutputDimensions.height),
+      });
+      return;
+    }
+
+    setSelectionResizePercent({
+      width: String(Math.max(1, Math.round((currentOutputDimensions.width / baseDimensions.width) * 100))),
+      height: String(Math.max(1, Math.round((currentOutputDimensions.height / baseDimensions.height) * 100))),
+    });
+  }, [getCurrentSelectionExportBaseRequest, getResizeBaseDimensions, getSelectionResizeDimensions]);
+
+  const handleSelectionResizeEnabledChange = useCallback((enabled) => {
+    setSelectionResizeEnabled(enabled);
+    if (!enabled) return;
+
+    const baseRequest = getCurrentSelectionExportBaseRequest();
+    const baseDimensions = baseRequest ? getResizeBaseDimensions(baseRequest.bounds) : null;
+    if (!baseDimensions) return;
+
+    setSelectionResizePixels((prev) => ({
+      width: prev.width || String(baseDimensions.width),
+      height: prev.height || String(baseDimensions.height),
+    }));
+  }, [getCurrentSelectionExportBaseRequest, getResizeBaseDimensions]);
+
+  const handleSelectionResizePercentChange = useCallback((dimension, value) => {
+    const sanitized = value.replace(/\D/g, "");
+    setSelectionResizePercent((prev) => {
+      if (selectionResizeMaintainAspect) {
+        return { width: sanitized, height: sanitized };
+      }
+      return { ...prev, [dimension]: sanitized };
+    });
+  }, [selectionResizeMaintainAspect]);
+
+  const handleSelectionResizePixelChange = useCallback((dimension, value) => {
+    const sanitized = value.replace(/\D/g, "");
+    const baseRequest = getCurrentSelectionExportBaseRequest();
+    const baseDimensions = baseRequest ? getResizeBaseDimensions(baseRequest.bounds) : null;
+
+    setSelectionResizePixels((prev) => {
+      const next = { ...prev, [dimension]: sanitized };
+      if (!baseDimensions || sanitized === "") {
+        return next;
+      }
+
+      const parsedValue = Number.parseInt(sanitized, 10);
+      if (!Number.isFinite(parsedValue)) return next;
+
+      if (dimension === "width") {
+        next.height = String(Math.max(1, Math.round((parsedValue * baseDimensions.height) / baseDimensions.width)));
+      } else {
+        next.width = String(Math.max(1, Math.round((parsedValue * baseDimensions.width) / baseDimensions.height)));
+      }
+
+      return next;
+    });
+  }, [getCurrentSelectionExportBaseRequest, getResizeBaseDimensions]);
+
+  useEffect(() => {
+    if (!selectionResizeEnabled || selectionResizeMode !== "pixels") return;
+
+    const baseRequest = getCurrentSelectionExportBaseRequest();
+    const baseDimensions = baseRequest ? getResizeBaseDimensions(baseRequest.bounds) : null;
+    if (!baseDimensions) return;
+
+    setSelectionResizePixels((prev) => ({
+      width: prev.width || String(baseDimensions.width),
+      height: prev.height || String(baseDimensions.height),
+    }));
+  }, [selectionResizeEnabled, selectionResizeMode, getCurrentSelectionExportBaseRequest, getResizeBaseDimensions]);
+
+  const getCurrentSelectionExportRequest = useCallback(() => {
+    const baseRequest = getCurrentSelectionExportBaseRequest();
+    if (!baseRequest) return null;
+
+    const resizeDimensions = getSelectionResizeDimensions(baseRequest.bounds);
+
+    return {
+      ...baseRequest,
+      resize_width: resizeDimensions?.width ?? null,
+      resize_height: resizeDimensions?.height ?? null,
+    };
+  }, [getCurrentSelectionExportBaseRequest, getSelectionResizeDimensions]);
+
+  const handleRenderPreview = useCallback(async () => {
+    const request = getCurrentSelectionExportRequest();
+    if (!request) {
+      setExportPreviewUrl("");
+      setExportPreviewError("");
+      return;
+    }
+
+    const requestId = ++exportPreviewRequestIdRef.current;
+    setIsExportPreviewLoading(true);
+    setExportPreviewError("");
+    try {
+      const dataUrl = await invoke("pdf_preview_selected_region", { request });
+      if (exportPreviewRequestIdRef.current !== requestId) return;
+      setExportPreviewUrl(dataUrl || "");
+      setExportPreviewError("");
+    } catch (err) {
+      if (exportPreviewRequestIdRef.current !== requestId) return;
+      setExportPreviewUrl("");
+      setExportPreviewError(String(err));
+    } finally {
+      if (exportPreviewRequestIdRef.current === requestId) {
+        setIsExportPreviewLoading(false);
+      }
+    }
+  }, [getCurrentSelectionExportRequest]);
+
+  useEffect(() => {
+    exportPreviewRequestIdRef.current += 1;
+    setExportPreviewUrl("");
+    setExportPreviewError("");
+    setIsExportPreviewLoading(false);
+  }, [activePanel, getCurrentSelectionExportRequest]);
+
   // ── Export selected region as single image (freeze-proof) ──
   const handleExportSelected = useCallback(async () => {
     if (isExporting) return; // guard: prevent double invocation
-    const effectiveSelectedIndices = Array.from(selectedObjectIndices).filter((idx) => !hiddenObjectIndices.has(idx));
-    if (effectiveSelectedIndices.length === 0) return;
-    const bounds = getSelectedBounds();
-    if (!bounds || !pdfPath) return;
+    const request = getCurrentSelectionExportRequest();
+    if (!request || !pdfPath) return;
+
     setIsExporting(true);
     setExportStatus("Preparing selection export...");
     setError("");
@@ -1422,13 +2326,9 @@ export default function PdfEditor({ onBack }) {
       await waitForNextPaint();
       await invoke("pdf_export_selected_region", {
         request: {
-          page_index: currentPageIndex,
-          bounds,
+          ...request,
           output_path: outputPath,
           format: ext,
-          hide_text: true,
-          transparent_bg: transparentBg,
-          selected_object_indices: effectiveSelectedIndices,
         },
       });
       setExportStatus(`Saved selected region to ${outputPath}`);
@@ -1437,7 +2337,7 @@ export default function PdfEditor({ onBack }) {
     } finally {
       setIsExporting(false);
     }
-  }, [isExporting, getSelectedBounds, pdfPath, currentPageIndex, imagesSaveFormat, transparentBg, selectedObjectIndices, hiddenObjectIndices, waitForNextPaint]);
+  }, [isExporting, getCurrentSelectionExportRequest, pdfPath, currentPageIndex, imagesSaveFormat, waitForNextPaint]);
 
   const handleExportSelectedSeparately = useCallback(async () => {
     if (isExporting || !pdfPath) return;
@@ -1456,18 +2356,42 @@ export default function PdfEditor({ onBack }) {
       for (let i = 0; i < targets.length; i++) {
         const target = targets[i];
         const suffix = String(i + 1).padStart(2, "0");
+        const componentExportPlan = !transparentBg
+          ? getComponentExportPlan({ selectedIndices: target.indices, baseBounds: target.bounds })
+          : null;
+        const exportBounds = componentExportPlan?.bounds || target.bounds;
+        const pdfObjectSelection = transparentBg
+          ? target.indices.filter((idx) => !isSyntheticTextObjectIndex(idx))
+          : [];
+        const selectedFormObjectIndices = getSelectedFormObjectIndices(target.indices);
+        const selectedTextBounds = transparentBg
+          ? target.indices
+            .filter((idx) => isSyntheticTextObjectIndex(idx))
+            .map((idx) => getObjectByIndex(pageObjects, idx)?.bounds)
+            .filter(Boolean)
+          : [];
         const outputPath = `${pdfPath}-page${currentPageIndex + 1}-selected-${suffix}-${ts}.${ext}`;
+        const hiddenPdfObjectIndices = !transparentBg && pdfObjectSelection.length === 0 && selectedTextBounds.length > 0
+          ? getTransparentTextOnlyHiddenPdfObjectIndices(exportBounds)
+          : [];
+        const resizeDimensions = getSelectionResizeDimensions(exportBounds);
         setExportStatus(`Exporting ${i + 1} of ${targets.length}: ${target.label}`);
 
         await invoke("pdf_export_selected_region", {
           request: {
             page_index: currentPageIndex,
-            bounds: target.bounds,
+            bounds: exportBounds,
             output_path: outputPath,
             format: ext,
-            hide_text: true,
+            hide_text: false,
             transparent_bg: transparentBg,
-            selected_object_indices: target.indices,
+            selected_object_indices: pdfObjectSelection,
+            selected_form_object_indices: selectedFormObjectIndices,
+            hidden_object_indices: hiddenPdfObjectIndices,
+            selected_text_bounds: selectedTextBounds,
+            hide_unselected_text: transparentBg,
+            resize_width: resizeDimensions?.width ?? null,
+            resize_height: resizeDimensions?.height ?? null,
           },
         });
       }
@@ -1478,7 +2402,7 @@ export default function PdfEditor({ onBack }) {
     } finally {
       setIsExporting(false);
     }
-  }, [isExporting, pdfPath, getSeparateExportTargets, waitForNextPaint, imagesSaveFormat, currentPageIndex, transparentBg]);
+  }, [isExporting, pdfPath, getSeparateExportTargets, waitForNextPaint, imagesSaveFormat, currentPageIndex, transparentBg, getTransparentTextOnlyHiddenPdfObjectIndices, getComponentExportPlan, getSelectionResizeDimensions, pageObjects, getSelectedFormObjectIndices]);
 
   // ── Toggle excluded child (for nested layer unselection) ──
   const toggleExcludedChild = useCallback((childIndex) => {
@@ -1501,7 +2425,7 @@ export default function PdfEditor({ onBack }) {
 
   const filteredLayerObjects = pageObjects.filter((o) => {
     if (objectFilter === "exportable") {
-      if (!["image", "path", "shading"].includes(o.object_type)) return false;
+      if (!["image", "path", "shading", "text"].includes(o.object_type)) return false;
     } else if (objectFilter === "path") {
       if (!SHAPE_OBJECT_TYPES.has(o.object_type)) return false;
     } else if (objectFilter !== "all" && o.object_type !== objectFilter) return false;
@@ -1514,6 +2438,20 @@ export default function PdfEditor({ onBack }) {
     }
     return true;
   });
+  const selectableFilteredObjectIndices = filteredLayerObjects
+    .filter((obj) => obj.bounds && !hiddenObjectIndices.has(obj.index))
+    .map((obj) => obj.index)
+    .sort((a, b) => a - b);
+  const allFilteredObjectsSelected = selectableFilteredObjectIndices.length > 0
+    && selectableFilteredObjectIndices.every((idx) => selectedObjectIndices.has(idx));
+
+  const handleSelectAllFilteredObjects = useCallback(() => {
+    if (selectableFilteredObjectIndices.length === 0) return;
+    setSelectedObjectIndices(new Set(selectableFilteredObjectIndices));
+    setExcludedChildren(new Set());
+    setDrawSelectionBounds(null);
+    setDrawSelectionSeedIndices([]);
+  }, [selectableFilteredObjectIndices]);
 
   const objectGroups = buildObjectGroups(pageObjects, manualGroupsForPage)
     .map((group) => ({
@@ -1527,10 +2465,42 @@ export default function PdfEditor({ onBack }) {
   const ungroupedLayerObjects = filteredLayerObjects.filter((obj) => !groupedMemberIndices.has(obj.index));
   const separateExportTargets = getSeparateExportTargets();
   const mergeableSelectedIndices = getMergeableSelectedIndices();
+  const hasExportable = pageObjects.some(
+    (o) => selectedObjectIndices.has(o.index) && !hiddenObjectIndices.has(o.index) && o.bounds,
+  );
+  const organizePagesView = organizeDraftPages.length > 0 || !isLoaded
+    ? organizeDraftPages
+    : createOrganizeExistingPages(pages);
+  const organizeCurrentPagePosition = organizePagesView.findIndex((draftPage) => (
+    draftPage.type === "existing" && draftPage.originalIndex === currentPageIndex
+  ));
+  const getOrganizePageThumbnail = useCallback((draftPage) => {
+    if (draftPage.type !== "existing") return null;
+    return thumbnails[draftPage.originalIndex]?.data ?? null;
+  }, [thumbnails]);
+  const handleOpenOrganizeDraftPage = useCallback((draftPage) => {
+    if (dragState.active) return;
+    if (draftPage.type !== "existing") {
+      setExportStatus("Save changes to preview newly added pages in the editor");
+      return;
+    }
+    setCurrentPageIndex(draftPage.originalIndex);
+    setActivePanel("pages");
+    renderPage(draftPage.originalIndex, activeLayers);
+  }, [dragState.active, renderPage, activeLayers]);
+  const currentSelectionBaseRequest = hasExportable ? getCurrentSelectionExportBaseRequest() : null;
+  const currentSelectionBaseDimensions = currentSelectionBaseRequest
+    ? getResizeBaseDimensions(currentSelectionBaseRequest.bounds)
+    : null;
+  const currentSelectionResizeDimensions = currentSelectionBaseRequest
+    ? getSelectionResizeDimensions(currentSelectionBaseRequest.bounds)
+    : null;
 
   const renderLayerObjectRow = (obj, nested = false, groupMemberIndices = null) => {
     const isSelected = selectedObjectIndices.has(obj.index);
     const isHidden = hiddenObjectIndices.has(obj.index);
+    const isEditingBounds = boundsEditTargetIdx === obj.index;
+    const isBoundsEdited = Boolean(manualBoundsForPage[obj.index]);
     const selectedBg = obj.object_type === "image" ? "bg-emerald-500/10 ring-1 ring-emerald-500/40" :
       obj.object_type === "text" ? "bg-sky-500/10 ring-1 ring-sky-500/40" :
       obj.object_type === "path" ? "bg-amber-500/10 ring-1 ring-amber-500/40" :
@@ -1614,11 +2584,64 @@ export default function PdfEditor({ onBack }) {
             {isHidden ? <IconEyeOff /> : <IconEye />}
           </button>
         </div>
-        {isSelected && obj.object_type === "text" && obj.text_content && (
-          <div className={`${nested ? "px-2 pb-1.5 pt-0" : "px-2.5 pb-2 pt-0.5"}`}>
-            <div className="px-2.5 py-1.5 rounded-md bg-slate-800 text-[10px] text-sky-300/80 select-all cursor-text break-words leading-relaxed border border-sky-500/10">
-              {obj.text_content}
-            </div>
+        {isSelected && (obj.bounds || (obj.object_type === "text" && obj.text_content)) && (
+          <div className={`${nested ? "px-2 pb-1.5 pt-0" : "px-2.5 pb-2 pt-0.5"} space-y-2`}>
+            {obj.object_type === "text" && obj.text_content && (
+              <div className="px-2.5 py-1.5 rounded-md bg-slate-800 text-[10px] text-sky-300/80 select-all cursor-text break-words leading-relaxed border border-sky-500/10">
+                {obj.text_content}
+              </div>
+            )}
+            {obj.bounds && (
+              <div className="px-2.5 py-2 rounded-md bg-slate-900/70 border border-slate-700/70 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">Bounds</span>
+                  {isBoundsEdited && (
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider bg-cyan-500/15 text-cyan-300">
+                      Edited
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-1.5 text-[10px] text-slate-400 tabular-nums">
+                  <span>L {obj.bounds[0].toFixed(1)}</span>
+                  <span>B {obj.bounds[1].toFixed(1)}</span>
+                  <span>R {obj.bounds[2].toFixed(1)}</span>
+                  <span>T {obj.bounds[3].toFixed(1)}</span>
+                </div>
+                <div className="flex gap-1.5">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (isEditingBounds) {
+                        setBoundsEditTargetIdx(null);
+                        setExportStatus("Cancelled bounds edit");
+                        return;
+                      }
+                      handleStartBoundsEdit(obj.index);
+                    }}
+                    className={`flex-1 px-2 py-1.5 rounded-md text-[10px] font-semibold transition-colors ${
+                      isEditingBounds
+                        ? "bg-rose-500/20 text-rose-300 ring-1 ring-rose-500/40"
+                        : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                    }`}
+                  >
+                    {isEditingBounds ? "Cancel Redraw" : "Redraw Box"}
+                  </button>
+                  {isBoundsEdited && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleResetBoundsEdit(obj.index);
+                      }}
+                      className="px-2 py-1.5 rounded-md text-[10px] font-semibold bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 hover:bg-cyan-500/15 transition-colors"
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1736,17 +2759,38 @@ export default function PdfEditor({ onBack }) {
                   {/* Header */}
                   <div className="flex items-center justify-between mb-6">
                     <h2 className="text-sm font-semibold text-slate-300">
-                      Organize Pages ({pages.length})
+                      Organize Pages ({organizePagesView.length})
                     </h2>
                     <div className="flex items-center gap-2">
+                      {hasPendingOrganizeChanges && (
+                        <span className="px-2.5 py-1 rounded-md text-[10px] font-semibold uppercase tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/20">
+                          Unsaved changes
+                        </span>
+                      )}
                       <button
-                        onClick={() => handleAddImageAsPage(pages.length)}
+                        onClick={handleDiscardOrganizeChanges}
+                        disabled={!hasPendingOrganizeChanges || isSavingOrganizeChanges}
+                        className="px-3 py-1.5 text-xs font-medium rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-slate-600 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                      >
+                        Discard
+                      </button>
+                      <button
+                        onClick={handleSaveOrganizeChanges}
+                        disabled={!hasPendingOrganizeChanges || isSavingOrganizeChanges}
+                        className="px-3 py-1.5 text-xs font-medium rounded-md bg-emerald-500/20 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                      >
+                        {isSavingOrganizeChanges ? "Saving..." : "Save Changes"}
+                      </button>
+                      <button
+                        onClick={() => handleDraftAddImageAsPage(organizePagesView.length)}
+                        disabled={isSavingOrganizeChanges}
                         className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white shadow-lg shadow-rose-500/15 transition-all active:scale-[0.97]"
                       >
                         <IconImageAdd /> Add Image as Page
                       </button>
                       <button
-                        onClick={() => handleInsertBlankPage(pages.length)}
+                        onClick={() => handleDraftInsertBlankPage(organizePagesView.length)}
+                        disabled={isSavingOrganizeChanges}
                         className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-slate-600 text-slate-300 transition-colors"
                       >
                         <IconPlus /> Add Blank Page
@@ -1754,11 +2798,19 @@ export default function PdfEditor({ onBack }) {
                     </div>
                   </div>
 
+                  <p className="mb-4 text-xs text-slate-500 leading-relaxed">
+                    Reorder, remove, or add pages here. The PDF is updated only when you save these staged changes.
+                  </p>
+
                   {/* Page grid */}
                   <div ref={gridRef} className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
-                    {pages.map((page, idx) => (
+                    {organizePagesView.map((page, idx) => {
+                      const isExistingPage = page.type === "existing";
+                      const thumbnailData = getOrganizePageThumbnail(page);
+                      const isCurrentDraftPage = idx === organizeCurrentPagePosition;
+                      return (
                       <div
-                        key={idx}
+                        key={page.draftId}
                         data-page-idx={idx}
                         onPointerDown={(e) => onDragPointerDown(e, idx)}
                         className={`group relative rounded-xl border transition-all select-none ${
@@ -1766,7 +2818,7 @@ export default function PdfEditor({ onBack }) {
                             ? "opacity-40 scale-95 border-slate-600 bg-slate-900/40"
                             : dragState.active && dragState.overIdx === idx
                             ? "border-rose-400 bg-rose-500/10 ring-2 ring-rose-400/30 scale-[1.02]"
-                            : currentPageIndex === idx
+                            : isCurrentDraftPage
                             ? "border-rose-500/50 bg-slate-800/80 ring-2 ring-rose-500/20 shadow-lg shadow-rose-500/10"
                             : "border-slate-700/50 bg-slate-900/60 hover:bg-slate-800/60 hover:border-slate-600"
                         } ${dragState.active ? "cursor-grabbing" : "cursor-grab"}`}
@@ -1781,9 +2833,18 @@ export default function PdfEditor({ onBack }) {
                         <div className="absolute top-2 left-2 z-10 px-1.5 py-0.5 rounded bg-slate-900/80 text-[10px] font-semibold text-slate-400 backdrop-blur-sm">
                           {idx + 1}
                         </div>
+                        {page.type !== "existing" && (
+                          <div className={`absolute top-2 right-2 z-10 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider backdrop-blur-sm ${
+                            page.type === "blank"
+                              ? "bg-cyan-500/15 text-cyan-300 border border-cyan-500/20"
+                              : "bg-emerald-500/15 text-emerald-300 border border-emerald-500/20"
+                          }`}>
+                            {page.type}
+                          </div>
+                        )}
 
                         {/* Downloading spinner overlay */}
-                        {downloadingPageIdx === idx && (
+                        {isExistingPage && downloadingPageIdx === page.originalIndex && (
                           <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-900/60 rounded-xl backdrop-blur-[1px]">
                             <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700">
                               <div className="w-3 h-3 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
@@ -1795,21 +2856,26 @@ export default function PdfEditor({ onBack }) {
                         {/* Thumbnail */}
                         <div
                           className="p-3 pt-7 cursor-pointer"
-                          onClick={() => {
-                            if (dragState.active) return;
-                            setCurrentPageIndex(idx);
-                            setActivePanel("pages");
-                            renderPage(idx, activeLayers);
-                          }}
+                          onClick={() => handleOpenOrganizeDraftPage(page)}
                         >
                           <div className="relative bg-white/5 rounded-lg overflow-hidden flex items-center justify-center" style={{ minHeight: 140 }}>
-                            {thumbnails[idx]?.data ? (
+                            {thumbnailData ? (
                               <img
-                                src={thumbnails[idx].data}
+                                src={thumbnailData}
                                 alt={`Page ${idx + 1}`}
                                 className="max-w-full max-h-44 object-contain"
                                 draggable={false}
                               />
+                            ) : page.type === "blank" ? (
+                              <div className="flex flex-col items-center justify-center gap-2 text-cyan-300/80 text-xs py-10">
+                                <IconPlus />
+                                <span>{page.label || "Blank Page"}</span>
+                              </div>
+                            ) : page.type === "image" ? (
+                              <div className="flex flex-col items-center justify-center gap-2 text-emerald-300/80 text-xs px-3 py-8 text-center">
+                                <IconImageAdd />
+                                <span className="break-all">{page.label || "Image Page"}</span>
+                              </div>
                             ) : (
                               <div className="text-slate-600 text-xs py-10">
                                 {thumbsLoading ? "..." : "No preview"}
@@ -1827,6 +2893,8 @@ export default function PdfEditor({ onBack }) {
 
                         {/* Download as image */}
                         <div className="flex items-center justify-center gap-1 px-2 pb-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                          {isExistingPage ? (
+                            <>
                           <div className="flex items-center bg-slate-800 rounded-md border border-slate-700 overflow-hidden">
                             {["png", "jpg", "webp"].map((fmt) => (
                               <button
@@ -1843,19 +2911,25 @@ export default function PdfEditor({ onBack }) {
                             ))}
                           </div>
                           <button
-                            onClick={(e) => { e.stopPropagation(); handleDownloadPage(idx, downloadFormat); }}
+                            onClick={(e) => { e.stopPropagation(); handleDownloadPage(page.originalIndex, downloadFormat); }}
                             disabled={downloadingPageIdx !== null}
                             title={`Download as ${downloadFormat.toUpperCase()}`}
                             className="p-1 rounded-md hover:bg-emerald-500/20 text-slate-500 hover:text-emerald-400 disabled:opacity-40 transition-colors"
                           >
                             <IconDownload />
                           </button>
+                            </>
+                          ) : (
+                            <span className="text-[9px] text-slate-600 uppercase tracking-wider">
+                              Saved pages can be downloaded
+                            </span>
+                          )}
                         </div>
 
                         {/* Action buttons */}
                         <div className="flex items-center justify-center gap-1 px-2 pb-3 opacity-0 group-hover:opacity-100 transition-opacity">
                           <button
-                            onClick={(e) => { e.stopPropagation(); handleMovePage(idx, -1); }}
+                            onClick={(e) => { e.stopPropagation(); handleDraftMovePage(idx, -1); }}
                             disabled={idx === 0}
                             title="Move left"
                             className="p-1.5 rounded-md hover:bg-slate-700 text-slate-500 hover:text-slate-300 disabled:opacity-20 disabled:cursor-not-allowed transition-colors"
@@ -1863,30 +2937,30 @@ export default function PdfEditor({ onBack }) {
                             <IconArrowUp />
                           </button>
                           <button
-                            onClick={(e) => { e.stopPropagation(); handleMovePage(idx, 1); }}
-                            disabled={idx === pages.length - 1}
+                            onClick={(e) => { e.stopPropagation(); handleDraftMovePage(idx, 1); }}
+                            disabled={idx === organizePagesView.length - 1}
                             title="Move right"
                             className="p-1.5 rounded-md hover:bg-slate-700 text-slate-500 hover:text-slate-300 disabled:opacity-20 disabled:cursor-not-allowed transition-colors"
                           >
                             <IconArrowDown />
                           </button>
                           <button
-                            onClick={(e) => { e.stopPropagation(); handleAddImageAsPage(idx + 1); }}
+                            onClick={(e) => { e.stopPropagation(); handleDraftAddImageAsPage(idx + 1); }}
                             title="Insert image after this page"
                             className="p-1.5 rounded-md hover:bg-slate-700 text-slate-500 hover:text-emerald-400 transition-colors"
                           >
                             <IconImageAdd />
                           </button>
                           <button
-                            onClick={(e) => { e.stopPropagation(); handleInsertBlankPage(idx + 1); }}
+                            onClick={(e) => { e.stopPropagation(); handleDraftInsertBlankPage(idx + 1); }}
                             title="Insert blank page after"
                             className="p-1.5 rounded-md hover:bg-slate-700 text-slate-500 hover:text-slate-300 transition-colors"
                           >
                             <IconPlus />
                           </button>
                           <button
-                            onClick={(e) => { e.stopPropagation(); handleDeletePage(idx); }}
-                            disabled={pages.length <= 1}
+                            onClick={(e) => { e.stopPropagation(); handleDraftDeletePage(idx); }}
+                            disabled={organizePagesView.length <= 1}
                             title="Delete page"
                             className="p-1.5 rounded-md hover:bg-red-500/20 text-slate-500 hover:text-red-400 disabled:opacity-20 disabled:cursor-not-allowed transition-colors"
                           >
@@ -1894,7 +2968,7 @@ export default function PdfEditor({ onBack }) {
                           </button>
                         </div>
                       </div>
-                    ))}
+                    )})}
                   </div>
 
                   {/* Export status toast */}
@@ -1936,7 +3010,7 @@ export default function PdfEditor({ onBack }) {
                       imgEl={imgRef.current}
                     />
                   )}
-                  {/* Bounding box overlay for non-text objects */}
+                  {/* Bounding box overlay for page objects */}
                   {activePanel === "images" && showObjectOverlay && pageObjects.length > 0 && pages[currentPageIndex] && imgRef.current && (
                     <ObjectOverlay
                       pageObjects={pageObjects}
@@ -1951,6 +3025,7 @@ export default function PdfEditor({ onBack }) {
                       onSelect={handlePageObjectSelection}
                       hiddenIndices={hiddenObjectIndices}
                       filter={objectFilter}
+                      selectionDisabled={boundsEditTargetIdx != null}
                       marqueeActive={marqueeActive}
                       marqueeStart={marqueeStart}
                       marqueeEnd={marqueeEnd}
@@ -1969,8 +3044,15 @@ export default function PdfEditor({ onBack }) {
                           const mw = Math.abs(marqueeEnd.x - marqueeStart.x);
                           const mh = Math.abs(marqueeEnd.y - marqueeStart.y);
                           if (mw > 5 && mh > 5) {
-                            handleMarqueeComplete({ x: mx, y: my, w: mw, h: mh });
-                            setObjectFilter("exportable");
+                            if (boundsEditTargetIdx != null) {
+                              const nextBounds = getDisplayRectPdfBounds({ x: mx, y: my, w: mw, h: mh });
+                              if (nextBounds) {
+                                handleApplyBoundsEdit(boundsEditTargetIdx, nextBounds);
+                              }
+                            } else {
+                              handleMarqueeComplete({ x: mx, y: my, w: mw, h: mh });
+                              setObjectFilter("exportable");
+                            }
                           }
                         }
                         setMarqueeActive(false);
@@ -2147,25 +3229,50 @@ export default function PdfEditor({ onBack }) {
                 {/* ── Organize Pages Panel ── */}
                 {activePanel === "organize" && (
                   <>
-                    <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                      Organize Pages
-                    </h3>
-                    <p className="text-[10px] text-slate-600 leading-relaxed">
-                      Rearrange, add, or remove pages. Click a thumbnail in the grid to view it.
-                    </p>
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                          Organize Pages
+                        </h3>
+                        {hasPendingOrganizeChanges && (
+                          <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/20">
+                            Draft
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-slate-600 leading-relaxed">
+                        Reorder pages locally first, then save once to update the PDF file.
+                      </p>
+                    </div>
 
                     <div className="space-y-2">
                       <button
-                        onClick={() => handleAddImageAsPage(pages.length)}
+                        onClick={() => handleDraftAddImageAsPage(organizePagesView.length)}
+                        disabled={isSavingOrganizeChanges}
                         className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white transition-all active:scale-[0.97] shadow-lg shadow-rose-500/15"
                       >
                         <IconImageAdd /> Add Image as Page
                       </button>
                       <button
-                        onClick={() => handleInsertBlankPage(pages.length)}
+                        onClick={() => handleDraftInsertBlankPage(organizePagesView.length)}
+                        disabled={isSavingOrganizeChanges}
                         className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 hover:border-slate-600 transition-all active:scale-[0.97]"
                       >
                         <IconPlus /> Add Blank Page
+                      </button>
+                      <button
+                        onClick={handleSaveOrganizeChanges}
+                        disabled={!hasPendingOrganizeChanges || isSavingOrganizeChanges}
+                        className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold bg-emerald-500/15 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/25 disabled:opacity-40 disabled:cursor-not-allowed transition-all active:scale-[0.97]"
+                      >
+                        {isSavingOrganizeChanges ? "Saving..." : "Save Changes"}
+                      </button>
+                      <button
+                        onClick={handleDiscardOrganizeChanges}
+                        disabled={!hasPendingOrganizeChanges || isSavingOrganizeChanges}
+                        className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 hover:border-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all active:scale-[0.97]"
+                      >
+                        Discard Changes
                       </button>
                     </div>
 
@@ -2173,36 +3280,39 @@ export default function PdfEditor({ onBack }) {
 
                     {/* Compact page list in sidebar */}
                     <div className="space-y-1.5 max-h-[calc(100vh-18rem)] overflow-y-auto pr-1">
-                      {pages.map((page, idx) => (
+                      {organizePagesView.map((page, idx) => {
+                        const thumbnailData = getOrganizePageThumbnail(page);
+                        const isCurrentDraftPage = idx === organizeCurrentPagePosition;
+                        return (
                         <div
-                          key={idx}
+                          key={page.draftId}
                           className={`group flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer transition-all ${
-                            currentPageIndex === idx
+                            isCurrentDraftPage
                               ? "bg-slate-800 border border-rose-500/40 ring-1 ring-rose-500/20"
                               : "bg-slate-800/30 border border-transparent hover:bg-slate-800/60 hover:border-slate-700"
                           }`}
-                          onClick={() => {
-                            setCurrentPageIndex(idx);
-                            setActivePanel("pages");
-                            renderPage(idx, activeLayers);
-                          }}
+                          onClick={() => handleOpenOrganizeDraftPage(page)}
                         >
                           {/* Mini thumbnail */}
                           <div className="w-8 h-10 bg-white/5 rounded overflow-hidden flex items-center justify-center shrink-0">
-                            {thumbnails[idx]?.data ? (
-                              <img src={thumbnails[idx].data} alt="" className="max-w-full max-h-full object-contain" draggable={false} />
+                            {thumbnailData ? (
+                              <img src={thumbnailData} alt="" className="max-w-full max-h-full object-contain" draggable={false} />
                             ) : (
-                              <span className="text-[8px] text-slate-600">{idx + 1}</span>
+                              <span className={`text-[8px] ${page.type === "blank" ? "text-cyan-400" : page.type === "image" ? "text-emerald-400" : "text-slate-600"}`}>
+                                {page.type === "blank" ? "BLK" : page.type === "image" ? "IMG" : idx + 1}
+                              </span>
                             )}
                           </div>
                           <div className="flex-1 min-w-0">
-                            <span className="text-[11px] text-slate-400">Page {idx + 1}</span>
+                            <span className="text-[11px] text-slate-400">
+                              {page.type === "existing" ? `Page ${idx + 1}` : page.label || `Page ${idx + 1}`}
+                            </span>
                             <div className="text-[9px] text-slate-600">{Math.round(page.width)}×{Math.round(page.height)}</div>
                           </div>
                           {/* Quick actions */}
                           <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
                             <button
-                              onClick={(e) => { e.stopPropagation(); handleMovePage(idx, -1); }}
+                              onClick={(e) => { e.stopPropagation(); handleDraftMovePage(idx, -1); }}
                               disabled={idx === 0}
                               title="Move up"
                               className="p-0.5 rounded hover:bg-slate-700 text-slate-500 hover:text-slate-300 disabled:opacity-20 transition-colors"
@@ -2210,16 +3320,16 @@ export default function PdfEditor({ onBack }) {
                               <IconArrowUp />
                             </button>
                             <button
-                              onClick={(e) => { e.stopPropagation(); handleMovePage(idx, 1); }}
-                              disabled={idx === pages.length - 1}
+                              onClick={(e) => { e.stopPropagation(); handleDraftMovePage(idx, 1); }}
+                              disabled={idx === organizePagesView.length - 1}
                               title="Move down"
                               className="p-0.5 rounded hover:bg-slate-700 text-slate-500 hover:text-slate-300 disabled:opacity-20 transition-colors"
                             >
                               <IconArrowDown />
                             </button>
                             <button
-                              onClick={(e) => { e.stopPropagation(); handleDeletePage(idx); }}
-                              disabled={pages.length <= 1}
+                              onClick={(e) => { e.stopPropagation(); handleDraftDeletePage(idx); }}
+                              disabled={organizePagesView.length <= 1}
                               title="Delete"
                               className="p-0.5 rounded hover:bg-red-500/20 text-slate-500 hover:text-red-400 disabled:opacity-20 transition-colors"
                             >
@@ -2227,7 +3337,7 @@ export default function PdfEditor({ onBack }) {
                             </button>
                           </div>
                         </div>
-                      ))}
+                      )})}
                     </div>
                   </>
                 )}
@@ -2282,6 +3392,19 @@ export default function PdfEditor({ onBack }) {
                         ))}
                       </div>
 
+                      {objectFilter === "all" && (
+                        <button
+                          type="button"
+                          onClick={handleSelectAllFilteredObjects}
+                          disabled={selectableFilteredObjectIndices.length === 0 || allFilteredObjectsSelected}
+                          className="w-full px-2.5 py-1.5 rounded-md text-[10px] font-semibold bg-slate-800/80 text-slate-300 border border-slate-700 hover:bg-slate-700 hover:border-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                        >
+                          {allFilteredObjectsSelected
+                            ? `All ${selectableFilteredObjectIndices.length} Objects Selected`
+                            : `Select All ${selectableFilteredObjectIndices.length > 0 ? `(${selectableFilteredObjectIndices.length})` : ""}`}
+                        </button>
+                      )}
+
                       <div className="flex gap-1.5">
                         <button
                           type="button"
@@ -2331,7 +3454,25 @@ export default function PdfEditor({ onBack }) {
                           <svg className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                             <path strokeLinecap="round" strokeLinejoin="round" d="M15.042 21.672L13.684 16.6m0 0l-2.51 2.225.569-9.47 5.227 7.917-3.286-.672zM12 2.25V4.5m5.834.166l-1.591 1.591M20.25 10.5H18M7.757 14.743l-1.59 1.59M6 10.5H3.75m4.007-4.243l-1.59-1.59" />
                           </svg>
-                          <span className="text-[11px] text-rose-300/90 leading-relaxed font-medium">Draw a rectangle on the page to auto-select objects in that area</span>
+                          <span className="text-[11px] text-rose-300/90 leading-relaxed font-medium">Draw a rectangle on the page to auto-select text, images, and shapes in that area</span>
+                        </div>
+                      )}
+
+                      {boundsEditTargetIdx != null && (
+                        <div className="flex items-start justify-between gap-2 px-3 py-2.5 rounded-lg bg-cyan-500/10 border border-cyan-500/20">
+                          <span className="text-[11px] text-cyan-200/90 leading-relaxed font-medium">
+                            Draw a new rectangle on the page to replace the selected bounds.
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setBoundsEditTargetIdx(null);
+                              setExportStatus("Cancelled bounds edit");
+                            }}
+                            className="px-2 py-1 rounded-md text-[10px] font-semibold bg-slate-900/60 text-cyan-200 hover:bg-slate-800 transition-colors"
+                          >
+                            Cancel
+                          </button>
                         </div>
                       )}
                     </div>
@@ -2460,7 +3601,12 @@ export default function PdfEditor({ onBack }) {
                             {selectedObjectIndices.size} object{selectedObjectIndices.size !== 1 ? "s" : ""} selected
                           </span>
                           <button
-                            onClick={() => { setSelectedObjectIndices(new Set()); setExcludedChildren(new Set()); }}
+                            onClick={() => {
+                              setSelectedObjectIndices(new Set());
+                              setExcludedChildren(new Set());
+                              setDrawSelectionBounds(null);
+                              setDrawSelectionSeedIndices([]);
+                            }}
                             className="text-[10px] text-slate-500 hover:text-rose-400 font-medium transition-colors px-2 py-0.5 rounded hover:bg-rose-500/10"
                           >
                             Clear all
@@ -2481,7 +3627,7 @@ export default function PdfEditor({ onBack }) {
                           {/* Nested layer tree for selected group objects */}
                           {(() => {
                           const selectedWithChildren = pageObjects.filter(
-                            (o) => selectedObjectIndices.has(o.index) && o.children && o.children.length > 0
+                            (o) => o.object_type !== "form" && selectedObjectIndices.has(o.index) && o.children && o.children.length > 0
                           );
                           if (selectedWithChildren.length === 0) return null;
                           return (
@@ -2538,6 +3684,37 @@ export default function PdfEditor({ onBack }) {
 
                           {/* Save format selector */}
                           <div>
+                          <label className="block text-[10px] text-slate-500 mb-1">Export mode</label>
+                          <div className="grid grid-cols-2 gap-1">
+                            <button
+                              type="button"
+                              onClick={() => setSelectionExportMode("normal")}
+                              className={`py-1.5 rounded text-[10px] font-semibold transition-colors ${
+                                selectionExportMode === "normal"
+                                  ? "bg-rose-500/20 text-rose-400 ring-1 ring-rose-500/40"
+                                  : "bg-slate-800 text-slate-400 hover:bg-slate-700"
+                              }`}
+                            >
+                              Normal
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSelectionExportMode("background")}
+                              className={`py-1.5 rounded text-[10px] font-semibold transition-colors ${
+                                selectionExportMode === "background"
+                                  ? "bg-cyan-500/20 text-cyan-300 ring-1 ring-cyan-500/40"
+                                  : "bg-slate-800 text-slate-400 hover:bg-slate-700"
+                              }`}
+                            >
+                              Background Only
+                            </button>
+                          </div>
+                          {selectionExportMode === "background" && (
+                            <p className="text-[9px] text-cyan-300/80 mt-1">Keeps images and shapes in the export area, while suppressing text and text-like overlays.</p>
+                          )}
+                          </div>
+
+                          <div>
                           <label className="block text-[10px] text-slate-500 mb-1">Export format</label>
                           <div className="grid grid-cols-3 gap-1">
                             {["png", "jpg", "webp"].map((fmt) => (
@@ -2558,7 +3735,7 @@ export default function PdfEditor({ onBack }) {
 
                           {/* Background mode selector */}
                           <div>
-                          <label className="block text-[10px] text-slate-500 mb-1">Background</label>
+                          <label className="block text-[10px] text-slate-500 mb-1">Component export</label>
                           <div className="grid grid-cols-2 gap-1">
                             <button
                               type="button"
@@ -2580,19 +3757,198 @@ export default function PdfEditor({ onBack }) {
                                   : "bg-slate-800 text-slate-400 hover:bg-slate-700"
                               }`}
                             >
-                              As-is
+                              Component
                             </button>
                           </div>
+                          {!transparentBg && selectionExportMode === "normal" && (
+                            <p className="text-[9px] text-cyan-300/80 mt-1">Exports only the selected component while preserving any selected background shapes, fills, and text.</p>
+                          )}
                           {transparentBg && imagesSaveFormat === "jpg" && (
                             <p className="text-[9px] text-amber-400/70 mt-1">JPEG doesn't support transparency — will export with white background</p>
                           )}
                           </div>
 
+                          {hasExportable && (
+                            <div className="space-y-3 rounded-xl border border-slate-800/90 bg-slate-950/40 p-3">
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="space-y-1">
+                                  <label className="block text-[10px] text-slate-500">Resize output</label>
+                                  <p className="text-[10px] text-slate-600 leading-relaxed">
+                                    Resize the exported image like Paint, without changing the selected PDF content.
+                                  </p>
+                                </div>
+                                <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+                                  <input
+                                    type="checkbox"
+                                    checked={selectionResizeEnabled}
+                                    onChange={(e) => handleSelectionResizeEnabledChange(e.target.checked)}
+                                    className="rounded border-slate-600 bg-slate-800 text-rose-500 focus:ring-rose-500/30 w-4 h-4"
+                                  />
+                                  <span className="text-[10px] font-semibold text-slate-300">Enable</span>
+                                </label>
+                              </div>
+
+                              {currentSelectionBaseDimensions && (
+                                <div className="flex items-center justify-between gap-2 rounded-lg bg-slate-900/70 border border-slate-800 px-2.5 py-2 text-[10px] text-slate-400">
+                                  <span>Original: {currentSelectionBaseDimensions.width} x {currentSelectionBaseDimensions.height} px</span>
+                                  <span className="text-slate-300 font-semibold">
+                                    Output: {(currentSelectionResizeDimensions || currentSelectionBaseDimensions).width} x {(currentSelectionResizeDimensions || currentSelectionBaseDimensions).height} px
+                                  </span>
+                                </div>
+                              )}
+
+                              {selectionResizeEnabled && (
+                                <div className="space-y-3">
+                                  <div className="grid grid-cols-2 gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSelectionResizeModeChange("percentage")}
+                                      className={`py-1.5 rounded text-[10px] font-semibold transition-colors ${
+                                        selectionResizeMode === "percentage"
+                                          ? "bg-rose-500/20 text-rose-400 ring-1 ring-rose-500/40"
+                                          : "bg-slate-800 text-slate-400 hover:bg-slate-700"
+                                      }`}
+                                    >
+                                      Percentage
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSelectionResizeModeChange("pixels")}
+                                      className={`py-1.5 rounded text-[10px] font-semibold transition-colors ${
+                                        selectionResizeMode === "pixels"
+                                          ? "bg-cyan-500/20 text-cyan-300 ring-1 ring-cyan-500/40"
+                                          : "bg-slate-800 text-slate-400 hover:bg-slate-700"
+                                      }`}
+                                    >
+                                      Pixels
+                                    </button>
+                                  </div>
+
+                                  <label className="flex items-center gap-2.5 cursor-pointer group">
+                                    <input
+                                      type="checkbox"
+                                      checked={selectionResizeMode === "pixels" ? true : selectionResizeMaintainAspect}
+                                      onChange={(e) => setSelectionResizeMaintainAspect(e.target.checked)}
+                                      disabled={selectionResizeMode === "pixels"}
+                                      className="rounded border-slate-600 bg-slate-800 text-rose-500 focus:ring-rose-500/30 w-4 h-4"
+                                    />
+                                    <span className={`text-[10px] transition-colors ${
+                                      selectionResizeMode === "pixels"
+                                        ? "text-slate-500"
+                                        : "text-slate-400 group-hover:text-slate-200"
+                                    }`}>
+                                      {selectionResizeMode === "pixels" ? "Pixel mode keeps aspect ratio linked like Paint" : "Maintain aspect ratio"}
+                                    </span>
+                                  </label>
+
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <label className="space-y-1">
+                                      <span className="block text-[10px] text-slate-500">Horizontal</span>
+                                      <div className="flex items-center rounded-lg border border-slate-700 bg-slate-900/80 px-2.5 py-2 focus-within:border-rose-500/50 focus-within:ring-1 focus-within:ring-rose-500/20">
+                                        <input
+                                          type="text"
+                                          inputMode="numeric"
+                                          value={selectionResizeMode === "percentage" ? selectionResizePercent.width : selectionResizePixels.width}
+                                          onChange={(e) => selectionResizeMode === "percentage"
+                                            ? handleSelectionResizePercentChange("width", e.target.value)
+                                            : handleSelectionResizePixelChange("width", e.target.value)}
+                                          className="w-full bg-transparent text-[11px] font-semibold text-slate-100 outline-none placeholder:text-slate-600"
+                                          placeholder={selectionResizeMode === "percentage" ? "100" : currentSelectionBaseDimensions ? String(currentSelectionBaseDimensions.width) : "0"}
+                                        />
+                                        <span className="text-[10px] text-slate-500">{selectionResizeMode === "percentage" ? "%" : "px"}</span>
+                                      </div>
+                                    </label>
+
+                                    <label className="space-y-1">
+                                      <span className="block text-[10px] text-slate-500">Vertical</span>
+                                      <div className="flex items-center rounded-lg border border-slate-700 bg-slate-900/80 px-2.5 py-2 focus-within:border-rose-500/50 focus-within:ring-1 focus-within:ring-rose-500/20">
+                                        <input
+                                          type="text"
+                                          inputMode="numeric"
+                                          value={selectionResizeMode === "percentage" ? selectionResizePercent.height : selectionResizePixels.height}
+                                          onChange={(e) => selectionResizeMode === "percentage"
+                                            ? handleSelectionResizePercentChange("height", e.target.value)
+                                            : handleSelectionResizePixelChange("height", e.target.value)}
+                                          className="w-full bg-transparent text-[11px] font-semibold text-slate-100 outline-none placeholder:text-slate-600"
+                                          placeholder={selectionResizeMode === "percentage" ? "100" : currentSelectionBaseDimensions ? String(currentSelectionBaseDimensions.height) : "0"}
+                                        />
+                                        <span className="text-[10px] text-slate-500">{selectionResizeMode === "percentage" ? "%" : "px"}</span>
+                                      </div>
+                                    </label>
+                                  </div>
+
+                                  <div className="flex items-center justify-between gap-3">
+                                    <p className="text-[9px] text-slate-500 leading-relaxed">
+                                      {selectionResizeMode === "percentage"
+                                        ? "Scale the exported image relative to the original crop size."
+                                        : "Set the exact output size in pixels for the exported image."}
+                                    </p>
+                                    <button
+                                      type="button"
+                                      onClick={handleResetSelectionResize}
+                                      className="px-2 py-1 rounded-md text-[10px] font-semibold bg-slate-800 text-slate-300 hover:bg-slate-700 transition-colors"
+                                    >
+                                      Reset
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {hasExportable && (
+                            <div className="space-y-2">
+                              <div className="flex items-center justify-between gap-2">
+                                <label className="block text-[10px] text-slate-500">Export preview</label>
+                                <button
+                                  type="button"
+                                  onClick={handleRenderPreview}
+                                  disabled={isExportPreviewLoading}
+                                  className="flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 hover:border-slate-500 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                                >
+                                  {isExportPreviewLoading ? (
+                                    <>
+                                      <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
+                                      </svg>
+                                      Rendering...
+                                    </>
+                                  ) : (
+                                    <>
+                                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                        <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                        <path strokeLinecap="round" strokeLinejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                                      </svg>
+                                      Render Preview
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                              <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-2">
+                                <div className="relative min-h-[140px] rounded-lg border border-slate-800/80 bg-slate-900/60 overflow-hidden flex items-center justify-center">
+                                  {exportPreviewUrl ? (
+                                    <img
+                                      src={exportPreviewUrl}
+                                      alt="Export preview"
+                                      className="max-h-48 w-auto max-w-full object-contain rounded-md"
+                                    />
+                                  ) : exportPreviewError ? (
+                                    <span className="text-[10px] text-amber-400/80 italic text-center px-3">
+                                      Preview failed: {exportPreviewError}
+                                    </span>
+                                  ) : (
+                                    <span className="text-[10px] text-slate-600 italic">
+                                      {isExportPreviewLoading ? "Rendering preview..." : "Click \"Render Preview\" to see export result"}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
                           {/* Export selected region */}
                           {(() => {
-                          const hasExportable = pageObjects.some(
-                            (o) => selectedObjectIndices.has(o.index) && !hiddenObjectIndices.has(o.index) && o.bounds && o.object_type !== "text"
-                          );
                           return hasExportable ? (
                             <div className="space-y-2">
                               <button
@@ -2600,20 +3956,20 @@ export default function PdfEditor({ onBack }) {
                                 disabled={isExporting}
                                 className="w-full py-2 rounded-lg text-xs font-semibold bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white transition-all active:scale-[0.97] shadow-lg shadow-rose-500/15 disabled:opacity-50 disabled:cursor-not-allowed"
                               >
-                                {isExporting ? "Exporting..." : `Export Combined as ${imagesSaveFormat.toUpperCase()}`}
+                                {isExporting ? "Exporting..." : selectionExportMode === "background" ? `Export Background as ${imagesSaveFormat.toUpperCase()}` : transparentBg ? `Export Transparent as ${imagesSaveFormat.toUpperCase()}` : `Export Component as ${imagesSaveFormat.toUpperCase()}`}
                               </button>
-                              {separateExportTargets.length > 1 && (
+                              {selectionExportMode === "normal" && separateExportTargets.length > 1 && (
                                 <button
                                   onClick={handleExportSelectedSeparately}
                                   disabled={isExporting}
                                   className="w-full py-2 rounded-lg text-xs font-semibold bg-slate-800 text-slate-200 border border-slate-700 hover:bg-slate-700 hover:border-slate-600 transition-all active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
-                                  {isExporting ? "Exporting..." : `Export ${separateExportTargets.length} Items Separately`}
+                                  {isExporting ? "Exporting..." : !transparentBg ? `Export ${separateExportTargets.length} Components Separately` : `Export ${separateExportTargets.length} Items Separately`}
                                 </button>
                               )}
                             </div>
                           ) : (
-                            <p className="text-[10px] text-slate-600 italic">Select images or shapes to export</p>
+                            <p className="text-[10px] text-slate-600 italic">Select text, images, or shapes to export</p>
                           );
                           })()}
                         </div>
@@ -2800,7 +4156,7 @@ function InfoRow({ label, value, mono = false }) {
 const OBJECT_COLORS = {
   image: { border: "rgba(52, 211, 153, 0.9)", bg: "rgba(52, 211, 153, 0.06)", hoverBg: "rgba(52, 211, 153, 0.22)", label: "#34d399" },
   text:  { border: "rgba(56, 189, 248, 0.6)", bg: "rgba(56, 189, 248, 0.04)", hoverBg: "rgba(56, 189, 248, 0.14)", label: "#38bdf8" },
-  path:  { border: "rgba(251, 191, 36, 0.4)", bg: "rgba(251, 191, 36, 0.02)", hoverBg: "rgba(251, 191, 36, 0.08)", label: "#fbbf24" },
+  path:  { border: "rgba(251, 191, 36, 0.92)", bg: "rgba(251, 191, 36, 0.05)", hoverBg: "rgba(251, 191, 36, 0.18)", label: "#fbbf24" },
   shading: { border: "rgba(168, 85, 247, 0.4)", bg: "rgba(168, 85, 247, 0.02)", hoverBg: "rgba(168, 85, 247, 0.08)", label: "#a855f7" },
   form:  { border: "rgba(244, 114, 182, 0.4)", bg: "rgba(244, 114, 182, 0.02)", hoverBg: "rgba(244, 114, 182, 0.08)", label: "#f472b6" },
 };
@@ -2882,6 +4238,7 @@ function ObjectOverlay({
   onSelect,
   hiddenIndices,
   filter,
+  selectionDisabled,
   marqueeActive,
   marqueeStart,
   marqueeEnd,
@@ -2902,7 +4259,7 @@ function ObjectOverlay({
     if (!obj.bounds) return false;
     if (hiddenIndices && hiddenIndices.has(obj.index)) return false;
     if (filter === "exportable") {
-      if (!["image", "path", "shading"].includes(obj.object_type)) return false;
+      if (!["image", "path", "shading", "text"].includes(obj.object_type)) return false;
     } else if (filter === "path") {
       if (!SHAPE_OBJECT_TYPES.has(obj.object_type)) return false;
     } else if (filter !== "all" && obj.object_type !== filter) return false;
@@ -2930,7 +4287,13 @@ function ObjectOverlay({
     return hits.map((h) => h.obj);
   };
 
-  // Click handler: find smallest unselected object under cursor, toggle it
+  const getPriorityHit = (hits) => {
+    if (hits.length === 0) return null;
+    const smallestSelected = hits.find((obj) => selectedIndices.has(obj.index));
+    return smallestSelected || hits[0];
+  };
+
+  // Click handler: deselect the smallest selected object first; otherwise select the smallest hit.
   const handleOverlayClick = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
@@ -2938,26 +4301,20 @@ function ObjectOverlay({
     const hits = hitTest(clickX, clickY);
     if (hits.length === 0) return;
 
-    // If the smallest hit is already selected, deselect it.
-    // Otherwise select the smallest unselected hit.
-    const smallestUnselected = hits.find((o) => !selectedIndices.has(o.index));
-    if (smallestUnselected) {
-      onSelect(smallestUnselected.index);
-    } else {
-      // All hits are selected — deselect the smallest
-      onSelect(hits[0].index);
+    const target = getPriorityHit(hits);
+    if (target) {
+      onSelect(target.index);
     }
   };
 
-  // Hover handler: highlight the smallest object under cursor
+  // Hover handler: preview the same object the click handler would toggle.
   const handleOverlayMove = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const clickY = e.clientY - rect.top;
     const hits = hitTest(clickX, clickY);
     if (hits.length > 0) {
-      // Prefer smallest unselected, else smallest
-      const best = hits.find((o) => !selectedIndices.has(o.index)) || hits[0];
+      const best = getPriorityHit(hits);
       onHover(best.index);
     } else {
       onHover(null);
@@ -2999,6 +4356,7 @@ function ObjectOverlay({
         const isHighlighted = isHovered || isSelected;
         const isImage = obj.object_type === "image";
         const isText = obj.object_type === "text";
+        const isPath = obj.object_type === "path";
 
         return (
           <div
@@ -3013,13 +4371,27 @@ function ObjectOverlay({
                 ? `${isHighlighted ? 2.5 : 1.5}px ${isSelected ? "solid" : "dashed"} ${colors.border}`
                 : isText
                 ? `${isHighlighted ? 2 : 1}px ${isSelected ? "solid" : "dashed"} ${colors.border}`
+                : isPath
+                ? `${isSelected ? 2.5 : isHovered ? 2 : 1}px ${isSelected ? "solid" : "dashed"} ${colors.border}`
                 : `${isHighlighted ? 1.5 : 0.5}px solid ${colors.border}`,
-              backgroundColor: isHighlighted ? colors.hoverBg : (isImage ? colors.bg : isText ? colors.bg : "transparent"),
+              backgroundColor: isPath
+                ? isSelected
+                  ? "rgba(251, 191, 36, 0.22)"
+                  : isHovered
+                  ? colors.hoverBg
+                  : "transparent"
+                : isHighlighted
+                ? colors.hoverBg
+                : (isImage ? colors.bg : isText ? colors.bg : "transparent"),
               zIndex: 1,
               boxShadow: isSelected
-                ? `0 0 0 2px ${colors.border}, 0 0 16px ${colors.bg}`
+                ? isPath
+                  ? `0 0 0 2px rgba(251, 191, 36, 0.95), inset 0 0 0 1px rgba(255, 251, 235, 0.75), 0 0 22px rgba(251, 191, 36, 0.35)`
+                  : `0 0 0 2px ${colors.border}, 0 0 16px ${colors.bg}`
+                : isPath && isHovered
+                ? `0 0 0 1px rgba(251, 191, 36, 0.9), inset 0 0 0 1px rgba(255, 251, 235, 0.45), 0 0 18px rgba(251, 191, 36, 0.28)`
                 : "none",
-              borderRadius: isImage ? "2px" : isText ? "2px" : "0",
+              borderRadius: isImage ? "2px" : isText ? "2px" : isPath ? "4px" : "0",
             }}
           >
 
@@ -3122,6 +4494,7 @@ function ObjectOverlay({
             e.currentTarget._wasMarqueeDrag = false;
             return;
           }
+          if (selectionDisabled) return;
           handleOverlayClick(e);
         }}
         onMouseMove={(e) => {
@@ -3129,6 +4502,7 @@ function ObjectOverlay({
             const rect = e.currentTarget.getBoundingClientRect();
             onMarqueeMove({ x: e.clientX - rect.left, y: e.clientY - rect.top });
           } else {
+            if (selectionDisabled) return;
             handleOverlayMove(e);
           }
         }}
